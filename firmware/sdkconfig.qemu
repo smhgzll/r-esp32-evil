@@ -1,0 +1,21 @@
+# Overlay for Espressif QEMU (esp32s3 machine). Applied on top of
+# sdkconfig.defaults by tools/re1tool.py qemu-build:
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.qemu"
+CONFIG_RE1_TARGET_QEMU=y
+CONFIG_RE1_TARGET_BOARD=n
+CONFIG_RE1_REMOTE_LINK=y
+# QEMU emulates quad (not octal) PSRAM
+CONFIG_SPIRAM_MODE_OCT=n
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+# The task watchdog interrupt misfires during init under QEMU
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_INT_WDT=n
+# Baud rate is meaningless in QEMU, and a custom UART clock stalls its
+# TX-idle emulation: keep the default console there.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM=n
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# QEMU has no Bluetooth radio.
+CONFIG_BT_ENABLED=n

@@ -1,0 +1,13 @@
+# Put every zero-initialised global of the game into PSRAM
+# (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY). Initialised .data stays in
+# internal RAM (~70 KB).
+[mapping:re1_extram_bss]
+archive: libre1.a
+entries:
+    * (extram_bss)
+
+# The renderer's hot functions run from internal RAM: they are marked
+# RE1_HOT_FN in the source (FlushTmdObjects, the rasteriser and sprite loops),
+# ~14 KB. The whole of TmdRenderer and MarniDX_SW used to be mapped here
+# (35 KB) - the rest of them (text layout, texture conversion) is not per
+# pixel, and the internal RAM went to Bluetooth.

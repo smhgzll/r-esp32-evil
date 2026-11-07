@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>r-esp32-evil</title>
+<style>
+  :root {
+    --bg: #101114; --panel: #1a1c21; --text: #d9dbe0; --muted: #8b9099;
+    --accent: #c0392b; --border: #2a2d34; --key: #262931;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .04em; }
+  header .stat { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; display: inline-block; }
+  .dot.on { background: #3fb950; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .screen-wrap { background: #000; border: 1px solid var(--border); border-radius: 6px;
+                 display: flex; align-items: center; justify-content: center; padding: 12px; }
+  canvas { width: 100%; max-width: 960px; aspect-ratio: 4 / 3; image-rendering: pixelated;
+           background: #000; }
+  .side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+             margin: 0 0 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 2px 0; }
+  td:first-child { color: var(--muted); }
+  kbd { background: var(--key); border: 1px solid var(--border); border-radius: 3px;
+        padding: 0 5px; font: 12px ui-monospace, monospace; }
+  #console { height: 260px; overflow: auto; white-space: pre-wrap; font: 11px/1.35 ui-monospace,
+             SFMono-Regular, Menlo, monospace; color: #b8bcc4; background: #0b0c0e;
+             border-radius: 4px; padding: 6px; margin: 0; }
+  .pad { display: grid; grid-template-columns: repeat(3, 52px); gap: 6px; justify-content: center; }
+  .btns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px; }
+  button { background: var(--key); color: var(--text); border: 1px solid var(--border);
+           border-radius: 5px; padding: 10px 6px; font: inherit; touch-action: none; user-select: none; }
+  button:active, button.held { background: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RESIDENT EVIL &middot; r-esp32-evil</h1>
+  <span class="dot" id="dot"></span>
+  <span class="stat" id="target">not connected</span>
+  <span class="stat" id="fps"></span>
+</header>
+<main>
+  <div class="screen-wrap"><canvas id="screen" width="160" height="120"></canvas></div>
+  <div class="side">
+    <div class="card">
+      <h2>Controls</h2>
+      <table>
+        <tr><td>Move</td><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td></tr>
+        <tr><td>Action / confirm</td><td><kbd>C</kbd> <kbd>Enter</kbd></td></tr>
+        <tr><td>Run / cancel</td><td><kbd>V</kbd></td></tr>
+        <tr><td>Aim</td><td><kbd>X</kbd></td></tr>
+        <tr><td>Inventory</td><td><kbd>Z</kbd> (pad Y)</td></tr>
+        <tr><td>Options</td><td><kbd>Esc</kbd> (pad Back)</td></tr>
+        <tr><td>Port menu</td><td><kbd>M</kbd> (pad Back + Start)</td></tr>
+      </table>
+      <div class="row" style="margin-top:8px">
+        <label><input type="checkbox" id="sound" checked> sound (host / QEMU)</label>
+        <label><input type="checkbox" id="smooth"> smooth scaling</label>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Touch pad</h2>
+      <div class="pad">
+        <span></span><button data-pad="1">&uarr;</button><span></span>
+        <button data-pad="4">&larr;</button><span></span><button data-pad="8">&rarr;</button>
+        <span></span><button data-pad="2">&darr;</button><span></span>
+      </div>
+      <div class="btns">
+        <button data-pad="256">Action</button>
+        <button data-pad="512">Run</button>
+        <button data-pad="8192">Aim</button>
+        <button data-pad="2048">Inventory</button>
+        <button data-pad="16384">Options</button>
+        <button data-pad="16777216" title="Port menu (M key, or OPTIONS + INVENTORY)">Menu</button>
+        <span title="Room tour: jump to a room by its hex id (e.g. 112 = WARDROBE), optionally a camera after it (112 2 = its second camera). From the title a new game starts for it.">
+          <input id="room" size="6" maxlength="6" placeholder="112 2" style="width:5em">
+          <button id="roomgo">Go to room</button>
+        </span>
+        <button id="refresh">Key frame</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Console</h2>
+      <pre id="console"></pre>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+// Wire format: port/include/re1_remote.h (RVL packets: A5 5A type len32 payload 5A).
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+let img = ctx.createImageData(160, 120);
+let fb = new Uint16Array(160 * 120);
+const con = document.getElementById("console");
+const $ = (id) => document.getElementById(id);
+
+let ws = null, frames = 0, lastFps = performance.now();
+
+function packet(type, payload) {
+  const p = new Uint8Array(8 + payload.length);
+  p[0] = 0xA5; p[1] = 0x5A; p[2] = type.charCodeAt(0);
+  new DataView(p.buffer).setUint32(3, payload.length, true);
+  p.set(payload, 7);
+  p[7 + payload.length] = 0x5A;
+  return p;
+}
+function send(type, payload) { if (ws && ws.readyState === 1) ws.send(packet(type, payload)); }
+
+function log(text) {
+  con.textContent += text;
+  if (con.textContent.length > 60000) con.textContent = con.textContent.slice(-40000);
+  con.scrollTop = con.scrollHeight;
+}
+
+function blit(w, h) {
+  const d = img.data;
+  for (let i = 0; i < w * h; i++) {
+    const c = fb[i];
+    const r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    d[i * 4] = (r << 3) | (r >> 2);
+    d[i * 4 + 1] = (g << 2) | (g >> 4);
+    d[i * 4 + 2] = (b << 3) | (b >> 2);
+    d[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function onFrame(dv, off, len) {
+  const w = dv.getUint16(off, true), h = dv.getUint16(off + 2, true);
+  const codec = dv.getUint8(off + 4);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    img = ctx.createImageData(w, h); fb = new Uint16Array(w * h);
+  }
+  let p = off + 10;   // u16 w, u16 h, u8 codec, u8 flags, u32 frameNo
+  const end = off + len;
+  if (codec === 0) {
+    for (let i = 0; i < w * h && p + 1 < end; i++, p += 2) fb[i] = dv.getUint16(p, true);
+  } else {
+    let i = 0;
+    while (p + 3 < end && i < w * h) {
+      const skip = dv.getUint16(p, true), count = dv.getUint16(p + 2, true);
+      p += 4; i += skip;
+      for (let k = 0; k < count; k++, p += 2) fb[i++] = dv.getUint16(p, true);
+    }
+  }
+  blit(w, h);
+  frames++;
+}
+
+// --- audio (host simulator streams its mix; a UART is too slow for it) ---
+let actx = null, audioTime = 0;
+function onAudio(dv, off, len) {
+  if (!$("sound").checked) return;
+  const rate = dv.getUint16(off, true);
+  const n = (len - 4) >> 1;
+  if (!actx) actx = new AudioContext();
+  const buf = actx.createBuffer(1, n, rate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = dv.getInt16(off + 4 + i * 2, true) / 32768;
+  const src = actx.createBufferSource();
+  src.buffer = buf; src.connect(actx.destination);
+  const now = actx.currentTime;
+  if (audioTime < now + 0.03 || audioTime > now + 0.5) audioTime = now + 0.08;
+  src.start(audioTime);
+  audioTime += n / rate;
+}
+
+function onPacket(ab) {
+  const dv = new DataView(ab);
+  const type = String.fromCharCode(dv.getUint8(2));
+  const len = dv.getUint32(3, true);
+  if (type === "F") onFrame(dv, 7, len);
+  else if (type === "A") onAudio(dv, 7, len);
+  else if (type === "I") {
+    try {
+      const info = JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 7, len)));
+      $("target").textContent = `${info.target} · ${info.fbW}×${info.fbH}`;
+    } catch (e) { /* ignore */ }
+  }
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { $("dot").classList.add("on"); if ($("target").textContent === "not connected") $("target").textContent = "connected"; };
+  ws.onclose = () => { $("dot").classList.remove("on"); $("target").textContent = "not connected"; setTimeout(connect, 1000); };
+  ws.onmessage = (e) => { if (typeof e.data === "string") log(e.data); else onPacket(e.data); };
+}
+connect();
+
+setInterval(() => {
+  const now = performance.now();
+  $("fps").textContent = `${(frames * 1000 / (now - lastFps)).toFixed(1)} fps`;
+  frames = 0; lastFps = now;
+}, 1000);
+
+$("smooth").onchange = (e) => { canvas.style.imageRendering = e.target.checked ? "auto" : "pixelated"; };
+$("refresh").onclick = () => send("R", new Uint8Array(0));
+
+// --- keyboard: Win32 virtual-key codes, which the game's bindings use ---
+const VK = { ArrowUp: 0x26, ArrowDown: 0x28, ArrowLeft: 0x25, ArrowRight: 0x27, Enter: 0x0D,
+             Escape: 0x1B, " ": 0x20, Shift: 0x10, Control: 0x11, F1: 0x70, F6: 0x75, F8: 0x77, F9: 0x78 };
+const held = new Set();
+function vkOf(e) {
+  if (VK[e.key] !== undefined) return VK[e.key];
+  if (e.code && e.code.startsWith("Key")) return e.code.charCodeAt(3);      // A-Z
+  if (e.code && e.code.startsWith("Digit")) return e.code.charCodeAt(5);    // 0-9
+  return -1;
+}
+// The default bindings: C = action. Enter and Esc also map onto the pad
+// (A / Back) so menus work with either.
+const KEY_PAD = { Enter: 256, Escape: 16384, z: 2048, Z: 2048 };
+let keyPad = 0, touchPad = 0, gamePad = 0;
+function sendPad() {
+  const m = keyPad | touchPad | gamePad;
+  send("P", new Uint8Array([m & 255, (m >> 8) & 255, (m >> 16) & 255, (m >> 24) & 255]));
+}
+// --- room tour: jump to a room ('C' command packet) ---
+function gotoRoom() {
+  const r = $("room").value.trim();
+  if (/^[0-9a-fA-F]{3}( +[0-9]{1,2})?$/.test(r)) send("C", new TextEncoder().encode("room " + r.replace(/ +/, " ")));
+}
+$("roomgo").onclick = gotoRoom;
+$("room").addEventListener("keydown", (e) => { if (e.key === "Enter") gotoRoom(); });
+
+const typing = (e) => e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA");
+window.addEventListener("keydown", (e) => {
+  if (typing(e)) return;
+  const vk = vkOf(e);
+  if (vk < 0 || e.repeat) { if (vk >= 0) e.preventDefault(); return; }
+  e.preventDefault();
+  held.add(vk);
+  send("K", new Uint8Array([vk, 1]));
+  if (KEY_PAD[e.key]) { keyPad |= KEY_PAD[e.key]; sendPad(); }
+  if (actx && actx.state === "suspended") actx.resume();
+});
+window.addEventListener("keyup", (e) => {
+  if (typing(e)) return;
+  const vk = vkOf(e);
+  if (vk < 0) return;
+  e.preventDefault();
+  held.delete(vk);
+  send("K", new Uint8Array([vk, 0]));
+  if (KEY_PAD[e.key]) { keyPad &= ~KEY_PAD[e.key]; sendPad(); }
+});
+window.addEventListener("blur", () => {
+  for (const vk of held) send("K", new Uint8Array([vk, 0]));
+  held.clear(); keyPad = 0; touchPad = 0; sendPad();
+});
+
+// --- touch / mouse pad ---
+document.querySelectorAll("[data-pad]").forEach((b) => {
+  const bit = Number(b.dataset.pad);
+  const down = (e) => { e.preventDefault(); b.classList.add("held"); touchPad |= bit; sendPad(); };
+  const up = (e) => { e.preventDefault(); b.classList.remove("held"); touchPad &= ~bit; sendPad(); };
+  b.addEventListener("pointerdown", down);
+  b.addEventListener("pointerup", up);
+  b.addEventListener("pointerleave", up);
+});
+
+// --- Gamepad API -> Marni pad mask (standard mapping) ---
+function pollGamepad() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let m = 0;
+  for (const gp of pads) {
+    if (!gp) continue;
+    const b = (i) => gp.buttons[i] && gp.buttons[i].pressed;
+    const ax = gp.axes[0] || 0, ay = gp.axes[1] || 0;
+    if (b(12) || ay < -0.5) m |= 1;
+    if (b(13) || ay > 0.5) m |= 2;
+    if (b(14) || ax < -0.5) m |= 4;
+    if (b(15) || ax > 0.5) m |= 8;
+    if (b(0)) m |= 0x100;       // A: action
+    if (b(1)) m |= 0x200;       // B: run / cancel
+    if (b(2)) m |= 0x400;       // X: aim
+    if (b(3)) m |= 0x800;       // Y: inventory
+    if (b(4)) m |= 0x1000;      // LB: aim
+    if (b(5)) m |= 0x2000;      // RB: aim
+    if (b(8)) m |= 0x4000;      // Back: options
+    if (b(9)) m |= 0x8000;      // Start: inventory
+    if (b(6)) m |= 0x40000;     // LT: run
+    if (b(7)) m |= 0x80000;     // RT: aim
+    break;
+  }
+  if (m !== gamePad) { gamePad = m; sendPad(); }
+  requestAnimationFrame(pollGamepad);
+}
+requestAnimationFrame(pollGamepad);
+</script>
+</body>
+</html>

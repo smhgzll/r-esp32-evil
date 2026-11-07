@@ -1,0 +1,31 @@
+# fetched by tools/fetch_decomp.sh
+/decomp/
+# builds
+/build/
+/firmware/build/
+/firmware/build-qemu/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
+/firmware/managed_components/
+/firmware/dependencies.lock
+__pycache__/
+*.pyc
+# editors and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+# logs, frame captures, test output
+*.log
+*.ppm
+# never commit game data or save files
+*.rv1
+*.pak
+*.rdt
+*.emd
+*.tim
+*.avi
+*.wav
+*.dat
+re1-sd/
+config.ini

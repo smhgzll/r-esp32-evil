@@ -1,0 +1,231 @@
+menu "r-esp32-evil"
+
+    choice RE1_TARGET
+        prompt "Target"
+        default RE1_TARGET_BOARD
+        help
+            BOARD: the real ESP32-S3 with the ST7735 panel, SD card, PCM5102A
+            and buttons/joysticks.
+            QEMU: Espressif's QEMU. No panel, SD, I2S or ADC there: the game
+            data is read from a host directory through semihosting and the
+            picture/input go over UART0 to the browser bridge
+            (tools/re1tool.py qemu).
+
+        config RE1_TARGET_BOARD
+            bool "ESP32-S3 board"
+        config RE1_TARGET_QEMU
+            bool "QEMU (esp32s3 machine)"
+    endchoice
+
+    config RE1_REMOTE_LINK
+        bool "Stream frames to the browser bridge over UART0"
+        default y if RE1_TARGET_QEMU
+        default n
+        help
+            Packetised frames (RGB565, delta-coded) and browser keyboard/pad
+            input share UART0 with the console. View with
+            `python3 tools/re1tool.py web --serial /dev/ttyUSB0`. The console baud
+            (ESP_CONSOLE_UART_BAUDRATE) is set to 2000000 in sdkconfig.defaults.
+            On the board this costs CPU time; leave it off for normal play.
+
+    choice RE1_REMOTE_PORT
+        prompt "Port of the browser link"
+        default RE1_REMOTE_PORT_UART0
+        depends on RE1_REMOTE_LINK && RE1_TARGET_BOARD
+        help
+            UART0: the "COM" USB-C port (USB-UART bridge chip), 2 Mbaud.
+            USB: the "USB" USB-C port (the chip's own USB-Serial-JTAG), about
+            5x faster; select ESP_CONSOLE_USB_SERIAL_JTAG as the console too, so
+            logs and the link share that one cable.
+        config RE1_REMOTE_PORT_UART0
+            bool "UART0 (COM port)"
+        config RE1_REMOTE_PORT_USB
+            bool "USB-Serial-JTAG (USB port)"
+    endchoice
+
+    config RE1_GAME_CORE
+        int "CPU core of the game loop"
+        default 1
+        range 0 1
+
+    config RE1_GAME_STACK_KB
+        int "Game loop (scheduler) stack, KB (internal RAM)"
+        default 32
+
+    config RE1_TASK_STACK_KB
+        int "Stack of each of the 3 game script tasks, KB (PSRAM)"
+        default 24
+        help
+            The cooperative tasks of the original scheduler
+            (TaskScheduler.cpp). The PC build gives them 256 KB each; the host
+            simulator measures ~5 KB high-water on x86.
+
+    menu "Display (ST7735 1.8\" 128x160, SPI)"
+        depends on RE1_TARGET_BOARD
+        config RE1_LCD_SCK
+            int "SCK pin"
+            default 12
+        config RE1_LCD_MOSI
+            int "SDA / MOSI pin"
+            default 11
+        config RE1_LCD_CS
+            int "CS pin"
+            default 10
+        config RE1_LCD_DC
+            int "A0 / DC pin"
+            default 9
+        config RE1_LCD_RST
+            int "RESET pin (-1 = not connected)"
+            default 14
+        config RE1_LCD_BL
+            int "LED / backlight pin (-1 = tied to 3V3)"
+            default 21
+        config RE1_LCD_SPI_MHZ
+            int "SPI clock, MHz"
+            default 27
+            range 1 80
+            help
+                ST7735 is specified for 15 MHz writes; most modules run at
+                27-40 MHz. Lower it if the picture shows noise.
+        config RE1_LCD_MADCTL
+            hex "MADCTL (rotation / colour order)"
+            default 0xA0
+            help
+                0xA0 = landscape (MY|MV), RGB. Add 0x08 for BGR panels (red and
+                blue swapped). 0x60 = landscape rotated the other way.
+        config RE1_LCD_BGR
+            bool "Panel is BGR (swap red/blue)"
+            default n
+        config RE1_LCD_INVERT
+            bool "Invert colours (INVON)"
+            default n
+        config RE1_LCD_X_OFFSET
+            int "Column offset of the visible area"
+            default 0
+            help
+                Some 1.8" variants ("red tab"/"black tab") need 1 or 2.
+        config RE1_LCD_Y_OFFSET
+            int "Row offset of the visible area"
+            default 0
+    endmenu
+
+    menu "SD card (SPI)"
+        depends on RE1_TARGET_BOARD
+        config RE1_SD_SCK
+            int "SCK pin"
+            default 40
+        config RE1_SD_MOSI
+            int "MOSI pin"
+            default 41
+        config RE1_SD_MISO
+            int "MISO pin"
+            default 42
+        config RE1_SD_CS
+            int "CS pin"
+            default 39
+        config RE1_SD_KHZ
+            int "SPI clock, kHz"
+            default 10000
+            help
+                10 MHz (~1 MB/s) is plenty for the game (a movie streams
+                ~0.2 MB/s) and tolerates breadboard wiring and the 74VHC125
+                buffer of the common adapters. 20000 works with short wires.
+    endmenu
+
+    menu "Audio (PCM5102A, I2S)"
+        depends on RE1_TARGET_BOARD
+        config RE1_I2S_BCK
+            int "BCK pin"
+            default 15
+        config RE1_I2S_WS
+            int "LCK / WS pin"
+            default 16
+        config RE1_I2S_DOUT
+            int "DIN pin (ESP32 data out)"
+            default 17
+        config RE1_AUDIO_VOLUME
+            int "Master volume, percent"
+            default 70
+            range 0 100
+    endmenu
+
+    menu "Controls"
+        depends on RE1_TARGET_BOARD
+        config RE1_STICK1_X
+            int "Joystick 1 X axis (ADC1 GPIO 1-10)"
+            default 1
+        config RE1_STICK1_Y
+            int "Joystick 1 Y axis (ADC1 GPIO 1-10)"
+            default 2
+        config RE1_STICK1_INVERT_X
+            bool "Invert joystick 1 X"
+            default n
+        config RE1_STICK1_INVERT_Y
+            bool "Invert joystick 1 Y"
+            default n
+        config RE1_STICK1_SW
+            int "Joystick 1 push button (-1 = none) -> inventory"
+            default 47
+        config RE1_STICK2_ENABLE
+            bool "Second joystick"
+            default n
+        config RE1_STICK2_X
+            int "Joystick 2 X axis (ADC1 GPIO 1-10)"
+            default 4
+            depends on RE1_STICK2_ENABLE
+        config RE1_STICK2_Y
+            int "Joystick 2 Y axis (ADC1 GPIO 1-10)"
+            default 5
+            depends on RE1_STICK2_ENABLE
+        config RE1_STICK2_SW
+            int "Joystick 2 push button (-1 = none) -> options"
+            default -1
+            depends on RE1_STICK2_ENABLE
+        choice RE1_STICK2_MODE
+            prompt "Joystick 2 function"
+            default RE1_STICK2_FACE
+            depends on RE1_STICK2_ENABLE
+            config RE1_STICK2_FACE
+                bool "Face buttons (up=aim, down=run/cancel, left=inventory, right=action)"
+            config RE1_STICK2_DPAD
+                bool "Second D-pad (same as joystick 1)"
+        endchoice
+        config RE1_STICK_DEADZONE
+            int "Joystick dead zone, percent of travel"
+            default 35
+            range 5 90
+        config RE1_BTN_ACTION
+            int "ACTION / confirm button (-1 = none)"
+            default 6
+        config RE1_BTN_CANCEL
+            int "RUN / cancel button (-1 = none)"
+            default 7
+        config RE1_BTN_AIM
+            int "AIM button (-1 = none)"
+            default 8
+        config RE1_BTN_INVENTORY
+            int "INVENTORY (status) button (-1 = none)"
+            default 18
+        config RE1_BTN_OPTIONS
+            int "OPTIONS button (-1 = none)"
+            default 3
+        config RE1_BTN_UP
+            int "D-pad UP button (-1 = none)"
+            default -1
+        config RE1_BTN_DOWN
+            int "D-pad DOWN button (-1 = none)"
+            default -1
+        config RE1_BTN_LEFT
+            int "D-pad LEFT button (-1 = none)"
+            default -1
+        config RE1_BTN_RIGHT
+            int "D-pad RIGHT button (-1 = none)"
+            default -1
+    endmenu
+
+    config RE1_QEMU_DATA_DIR
+        string "QEMU: host directory with the prepared SD tree (relative to QEMU's cwd)"
+        default "sdcard"
+        depends on RE1_TARGET_QEMU
+
+endmenu

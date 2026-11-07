@@ -1,0 +1,2838 @@
+r-esp32-evil: port hooks for the ESP32-S3 / QEMU / host-simulator targets
+
+Every change is behind a macro that the upstream Windows and Linux builds do
+not define, so with none of them set the decomp builds exactly as upstream:
+
+  RE1_PORT_TASKSWITCH_EXTERNAL  TaskScheduler.cpp takes its three switch
+                                primitives from the port (FreeRTOS tasks on
+                                Xtensa, where ucontext does not exist)
+  RE1_PORT_OVERRIDE_RAND        rand()/srand() override as on Linux (newlib)
+  RE1_PORT_VIDEO_RV1            movies may be re-encoded ".rv1" files
+  RE1_SMALL_MEM                 fit 8 MB of PSRAM (and the scarce internal
+                                RAM: the never-written room sound table goes
+                                to flash): large function-local
+                                scratch statics become call-scoped heap
+                                buffers (PortMem.h), port-only headroom is
+                                trimmed, the PAK LZW dictionary is packed and
+                                lives only while a background unpacks
+  RE1_BG_ON_DEMAND              read each camera's background at the cut
+                                instead of caching every camera (768 KB)
+  RE1_TMD_MAX_TRIS_COLLECT      size of the per-frame TMD triangle pool
+  RE1_PORT_TEXTURE_BGR555       display_image hands 15-bit pixels to the
+                                backend (no 300 KB RGBA copy per camera cut)
+  RE1_PORT_TEXT_SCALE           the font upload tells the backend which
+                                texture is the game font (text layer)
+  RE1_PORT_TEXTURE_INDEXED      mask / effect pages go to the backend as PS1
+                                indexed pixels (no 256 KB RGBA copy per cut)
+  RE1_PORT_VRAM16               the item/menu VRAM pages are kept at 16 bits
+  RE1_PORT_EXTRAS               OPTIONS > EXTRAS (text size, give item,
+                                invincible, invisible, FPS counter)
+  RE1_PORT_TEXTURE_PAL8         model skins and effect pages are flagged as
+                                palette art (8-bit storage in the backend)
+  RE1_PORT_BENCH                OPTIONS > BENCHMARK: a room tour through
+                                every room and camera (no cutscenes, no
+                                NPCs), with load times and frame rates on
+                                the console; re1bench_goto / re1bench_camera
+                                jump to a room and camera by command
+  RE1_PORT_PROFILE              per-frame time buckets for the [PERF] line
+                                and work counters for the [WORK] line
+                                (PortProf.h -> port/include/re1_prof.h)
+  RE1_PORT_FAST                 same output, less work: the sprite queue is
+                                not re-sorted (nor re-checked) when already in
+                                order and a depth range is found by binary
+                                search; the model pipeline reuses its scratch,
+                                drops primitives wholly off the screen before
+                                lighting them, lights only the vertices of
+                                drawn triangles, divides without a library
+                                call (re1_fastmath.h), writes compact sort
+                                keys as it emits and draws the sorted pool in
+                                place (MarniDX::DrawTriangles3DList); on the
+                                ESP32 its hot loop runs from IRAM (RE1_HOT_FN)
+
+---
+diff --git a/src/Globals.cpp b/src/Globals.cpp
+index ff3fc9b..ceef2ba 100644
+--- a/src/Globals.cpp
++++ b/src/Globals.cpp
+@@ -201,7 +201,7 @@ BYTE           g_bgPakLoadBuffer[0x20000] = {};
+ 
+ // 0x00b0a0d0 - All-camera cached background buffer (768KB)
+ // Ghidra detects 786440 bytes (0xC0008) until the next global
+-BYTE           g_bgCacheBuffer[0xC0008] = {};
++BYTE           g_bgCacheBuffer[RE1_BG_CACHE_BYTES] = {};   // 0xC0008 upstream
+ 
+ // 0x00bca0d8
+ signed char g_ScreenShakeOffsetX = 0;
+@@ -1867,7 +1867,11 @@ unsigned int   g_pakDecompMaxCode = 0x1ff;
+ // 0x00d2b0b0 - LZW dictionary: one array of 12-byte records. The prefix field
+ // (+4) and char field (+8) were previously declared as two separate arrays,
+ // which put every dictionary access at the wrong address. See Globals.h.
++#if defined(RE1_SMALL_MEM)
++PakDictEntry*  g_pakDict = NULL;   // r-esp32-evil: borrowed per unpack (FileLoader.cpp)
++#else
+ PakDictEntry   g_pakDict[PAK_DICT_ENTRIES] = {};
++#endif
+ 
+ // 0x00d227d0 - String output buffer for building decoded strings
+ char           g_pakStringBuf[512] = {};
+@@ -2055,13 +2059,20 @@ extern "C" int re1_rand(void)
+     return (int)((g_randState >> 16) & 0x7fff);
+ }
+ 
+-#if defined(__linux__)
+-extern "C" int rand() noexcept
++#if defined(__linux__) || defined(RE1_PORT_OVERRIDE_RAND)
++// glibc declares rand/srand noexcept (__THROW); newlib (ESP-IDF) does not, and
++// the redeclaration must match the C library's own.
++#if defined(__GLIBC__)
++#define RE1_RAND_NOEXCEPT noexcept
++#else
++#define RE1_RAND_NOEXCEPT
++#endif
++extern "C" int rand() RE1_RAND_NOEXCEPT
+ {
+     return re1_rand();
+ }
+ 
+-extern "C" void srand(unsigned int seed) noexcept
++extern "C" void srand(unsigned int seed) RE1_RAND_NOEXCEPT
+ {
+     re1_srand(seed);
+ }
+diff --git a/src/Globals.h b/src/Globals.h
+index 73c9db5..a56efc5 100644
+--- a/src/Globals.h
++++ b/src/Globals.h
+@@ -608,7 +608,7 @@ extern "C" {
+ void re1_srand(unsigned int seed);
+ int  re1_rand(void);
+ }
+-#if !defined(__linux__)
++#if !defined(__linux__) && !defined(RE1_PORT_OVERRIDE_RAND)
+ #define rand(...)  re1_rand(__VA_ARGS__)
+ #define srand(...) re1_srand(__VA_ARGS__)
+ #endif
+@@ -1059,7 +1059,12 @@ extern int           g_FmvCharacterId;
+ extern BYTE          g_bgPakLoadBuffer[131072];
+ 
+ // 0x00b0a0d0 - Cached all-camera background buffer
+-extern BYTE          g_bgCacheBuffer[786440];
++#if defined(RE1_BG_ON_DEMAND)
++#define RE1_BG_CACHE_BYTES 16      // r-esp32-evil: backgrounds load per camera cut
++#else
++#define RE1_BG_CACHE_BYTES 786440
++#endif
++extern BYTE          g_bgCacheBuffer[RE1_BG_CACHE_BYTES];
+ 
+ // Background loading mode flag (0 = per-camera load/display, non-zero = cache all cameras)
+ extern int           g_bgCacheMode;                    // 0x004d46b4
+@@ -1101,6 +1106,16 @@ extern unsigned int  g_pakDecompMaxCode;               // 0x00d2b0a0
+ // and g_pakDictChar at 0x00d2b0b8, strides 4 and 1). Those are the +4 and +8
+ // FIELDS of a single 12-byte record, not independent arrays, so every walk of
+ // the dictionary read the wrong addresses and ran off the end.
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: the same fields, packed. Codes stop below PAK_DICT_ENTRIES
++// (34981), so the prefix fits 16 bits; `unused` is never read.
++struct PakDictEntry {
++    unsigned short prefix;
++    char           ch;
++    signed char    unused;
++};
++static_assert(sizeof(PakDictEntry) == 4, "PakDictEntry (small) size mismatch");
++#else
+ struct PakDictEntry {
+     int  unused;    // +0  0x00d2b0b0 - set to -1 by pak_decomp_reset, never read
+     int  prefix;    // +4  0x00d2b0b4 - previous code in the LZW chain
+@@ -1108,13 +1123,18 @@ struct PakDictEntry {
+     char pad[3];    // +9
+ };
+ static_assert(sizeof(PakDictEntry) == 12, "PakDictEntry size mismatch");
++#endif
+ 
+ // pak_decomp_reset walks entries from 0x00d2b0b0 while the pointer is below
+ // g_pakDecompBitMask (0x00d91a64), which is 34981 records. Only codes up to
+ // 0x1FFF are reachable, so the tail is never used — but the count is what the
+ // original clears, so it is reproduced here.
+ #define PAK_DICT_ENTRIES 34981
++#if defined(RE1_SMALL_MEM)
++extern PakDictEntry* g_pakDict;   // r-esp32-evil: lives only while a .pak unpacks (FileLoader.cpp)
++#else
+ extern PakDictEntry  g_pakDict[PAK_DICT_ENTRIES];      // 0x00d2b0b0
++#endif
+ 
+ // LZW string output buffer (for building decoded strings)
+ extern char          g_pakStringBuf[512];              // 0x00d227d0
+@@ -1815,7 +1835,12 @@ extern BYTE          g_shootDirEspBuffer[73728];
+ // original 832 KB. Nothing addresses the buffer past its original end, so the
+ // original layout inside it is unchanged.
+ #define DATA_BUFFER_ORIGINAL_SIZE  832728
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: no Saturn-converted models on the target; keep 64 KB slack.
++#define DATA_BUFFER_PORT_HEADROOM  0x10000
++#else
+ #define DATA_BUFFER_PORT_HEADROOM  0x100000
++#endif
+ extern BYTE          g_DataBuffer[DATA_BUFFER_ORIGINAL_SIZE + DATA_BUFFER_PORT_HEADROOM];
+ 
+ // 0x00cf2298 - TIM Image buffer, first 20 bytes are the header
+diff --git a/src/PortMem.h b/src/PortMem.h
+new file mode 100644
+index 0000000..16ec1c0
+--- /dev/null
++++ b/src/PortMem.h
+@@ -0,0 +1,42 @@
++// PortMem.h - r-esp32-evil port: memory-footprint switches.
++//
++// The PC build keeps several large scratch arrays as function-local statics
++// (multi-megabyte .bss). On a target with 8 MB of PSRAM, RE1_SMALL_MEM turns
++// them into heap buffers that live only for the call that needs them, and
++// trims the port-added headroom of a few pools. With RE1_SMALL_MEM undefined
++// every site compiles exactly as upstream.
++#pragma once
++
++#include <stdlib.h>
++#include <string.h>
++
++// The port's big-temporary allocator (port/common/BigAlloc.cpp): a block
++// reserved at boot for the 256 KB pictures room loads build again and again.
++extern "C" void* re1port_big_alloc(size_t size);
++extern "C" void  re1port_big_free(void* p);
++
++// A call-scoped buffer. NULL (p == NULL) when memory is exhausted: callers
++// check and skip their work rather than abort the game.
++template <typename T>
++struct Re1Scratch {
++    T* p;
++    explicit Re1Scratch(size_t n) : p(NULL) {
++        if (n == 0) return;
++        p = (T*)re1port_big_alloc(n * sizeof(T));
++        if (p != NULL) memset((void*)p, 0, n * sizeof(T));
++    }
++    ~Re1Scratch() { re1port_big_free(p); }
++    T& operator[](size_t i) { return p[i]; }
++    operator T*() { return p; }
++    Re1Scratch(const Re1Scratch&) = delete;
++    Re1Scratch& operator=(const Re1Scratch&) = delete;
++};
++
++// Declare `name` as `type name[count]`: a static array normally, a call-scoped
++// heap buffer under RE1_SMALL_MEM. `type` may itself be an array type.
++#if defined(RE1_SMALL_MEM)
++#define RE1_SCRATCH(type, name, count) Re1Scratch<type> name(count)
++#else
++template <typename T, size_t N> using Re1StaticArr = T[N];
++#define RE1_SCRATCH(type, name, count) static Re1StaticArr<type, count> name
++#endif
+diff --git a/src/PortProf.h b/src/PortProf.h
+new file mode 100644
+index 0000000..65a9ad2
+--- /dev/null
++++ b/src/PortProf.h
+@@ -0,0 +1,27 @@
++// PortProf.h - r-esp32-evil port: profiling scopes in game code.
++//
++// With RE1_PORT_PROFILE the port measures where a frame's time goes on the
++// target (port/include/re1_prof.h, the [PERF] console line); RE1_PROF(bucket)
++// charges the rest of the enclosing block to that bucket. Without it the
++// macro is empty and the code is exactly upstream's.
++#pragma once
++
++// RE1_HOT_FN: with RE1_PORT_FAST on the ESP32 target, a function the renderer
++// runs per vertex every frame is kept in internal RAM (IRAM). Empty elsewhere.
++#ifndef RE1_HOT_FN
++#if defined(RE1_PORT_FAST) && defined(ESP_PLATFORM)
++#include "esp_attr.h"
++#define RE1_HOT_FN IRAM_ATTR
++#else
++#define RE1_HOT_FN
++#endif
++#endif
++
++#if defined(RE1_PORT_PROFILE)
++#include "re1_prof.h"
++#define RE1_PROF(bucket) RE1_PROF_SCOPE(bucket)
++#define RE1_WORK(counter, n) RE1_WORK_ADD(counter, n)
++#else
++#define RE1_PROF(bucket) ((void)0)
++#define RE1_WORK(counter, n) ((void)0)
++#endif
+diff --git a/src/game/CollisionDebug.cpp b/src/game/CollisionDebug.cpp
+index e7c4e20..748c72b 100644
+--- a/src/game/CollisionDebug.cpp
++++ b/src/game/CollisionDebug.cpp
+@@ -41,7 +41,11 @@ int  g_iCollisionDebugY    = 0;    // world Y of the plane the overlay is drawn
+ 
+ // MarniDX::DrawTriangles takes at most 1024 triangles per call, so the batch is
+ // flushed as it fills rather than silently dropping the tail.
++#if defined(RE1_SMALL_MEM)
++#define COLL_DBG_MAX_TRIS 16      // debug overlay only
++#else
+ #define COLL_DBG_MAX_TRIS 1024
++#endif
+ 
+ static float    s_tris[COLL_DBG_MAX_TRIS * 3 * 8];
+ static int      s_triCount   = 0;
+diff --git a/src/game/DebugMenu.cpp b/src/game/DebugMenu.cpp
+index 6ac15b7..ae99b4f 100644
+--- a/src/game/DebugMenu.cpp
++++ b/src/game/DebugMenu.cpp
+@@ -46,6 +46,7 @@
+ //     UTILITY MENU
+ //     ...
+ // ============================================================================
++#include "../PortMem.h"
+ #include "../Globals.h"
+ #include "../platform/platform.h"
+ #include "../DebugPrint.h"
+@@ -56,6 +57,7 @@
+ #include "FileLoader.h"
+ #include "saturn/SaturnBattle.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <cmath>
+ 
+@@ -629,8 +631,37 @@ static void DebugRoom_DecodeDest(unsigned char dest, unsigned char curStage,
+     }
+ }
+ 
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: read `n` bytes of a game file from `offset` (short reads are
++// zero-filled); the file's size goes to *outSize. 0 = no such file.
++static int DebugRoom_ReadPart(const char* path, unsigned int offset, unsigned char* buf,
++                              size_t n, size_t* outSize)
++{
++    char resolved[260], normalized[260];
++    const char* filePath = ResolveAssetRoot(path, resolved, sizeof(resolved));
++    filePath = plat_normalize_path(filePath, normalized, sizeof(normalized));
++    FILE* fp = fopen(filePath, "rb");
++    if (fp == NULL) return 0;
++    fseek(fp, 0, SEEK_END);
++    const long fileSize = ftell(fp);
++    if (outSize != NULL) *outSize = fileSize > 0 ? (size_t)fileSize : 0;
++    memset(buf, 0, n);
++    int ok = fileSize > 0 && (long)offset < fileSize && fseek(fp, (long)offset, SEEK_SET) == 0;
++    if (ok) fread(buf, 1, n, fp);
++    fclose(fp);
++    return ok;
++}
++#endif
++
++#if defined(RE1_PORT_BENCH)
++static int s_benchLoaded = 0;   // room_transition_load finished (OPTIONS > BENCHMARK)
++#endif
++
+ void DebugRoomChange_ApplyPendingPlacement(void)
+ {
++#if defined(RE1_PORT_BENCH)
++    s_benchLoaded = 1;
++#endif
+     if (s_dbgRoomChangeArmed == 0) {
+         return;
+     }
+@@ -706,10 +737,37 @@ void DebugRoomChange_ApplyPendingPlacement(void)
+                     hexDigits[nRoom >> 4],
+                     hexDigits[nRoom & 0xF]);
+ 
+-            static unsigned char s_neighbourRdt[768 * 1024];   // largest shipped RDT is ~630KB
++#if defined(RE1_SMALL_MEM)
++            // r-esp32-evil: only the header and the init script's first 2 KB
++            // are read, not the whole RDT into a 768 KB buffer (the scan
++            // below never looks further).
++            unsigned int winBase = 0;
++            size_t size = 0;
++            unsigned char s_neighbourHdr[0x94];
++            static unsigned char s_neighbourWin[2048 + 32];
++            unsigned char* s_neighbourRdt = s_neighbourHdr;     // + 0x60 below
++            if (DebugRoom_ReadPart(path, 0, s_neighbourHdr, sizeof(s_neighbourHdr), &size) &&
++                size > 0x94 + 0x100) {
++                winBase = *(unsigned int*)(s_neighbourHdr + 0x60);
++                if (winBase > 0x94 && winBase < size - 4 &&
++                    DebugRoom_ReadPart(path, winBase, s_neighbourWin, sizeof(s_neighbourWin), NULL)) {
++                    s_neighbourRdt = s_neighbourWin;
++                } else {
++                    size = 0;
++                }
++            }
++#define RDT_AT(off) (s_neighbourRdt + ((off) - winBase))
++#else
++            RE1_SCRATCH(unsigned char, s_neighbourRdt, 768 * 1024);   // largest shipped RDT is ~630KB
+             size_t size = LoadFile(path, s_neighbourRdt, 1);
++#define RDT_AT(off) (s_neighbourRdt + (off))
++#endif
+             if (size > 0x94 + 0x100) {
++#if defined(RE1_SMALL_MEM)
++                unsigned int init = winBase;
++#else
+                 unsigned int init = *(unsigned int*)(s_neighbourRdt + 0x60);
++#endif
+                 if (init > 0x94 && init < size - 4) {
+                     // The init script opens with 2 preamble bytes and its door
+                     // records follow. Scan a bounded window for a door record
+@@ -720,10 +778,10 @@ void DebugRoomChange_ApplyPendingPlacement(void)
+                         end = size - 26;
+                     }
+                     for (unsigned int p = init + 2; p < end; p++) {
+-                        if (s_neighbourRdt[p] != 0x0C) {
++                        if (*RDT_AT(p) != 0x0C) {
+                             continue;
+                         }
+-                        unsigned char* r = s_neighbourRdt + p + 2;
++                        unsigned char* r = RDT_AT(p + 2);
+                         unsigned short rzw = *(unsigned short*)(r + 4);
+                         unsigned short rzd = *(unsigned short*)(r + 6);
+                         // Zone extents: the widest shipped door zone is 6000
+@@ -760,6 +818,8 @@ void DebugRoomChange_ApplyPendingPlacement(void)
+             }
+         }
+ 
++#undef RDT_AT
++
+         // Fallback: the dir heuristic (edge of this room's own zone). Verified
+         // only for a subset of rooms, so it is used only when the paired
+         // record could not be found.
+@@ -1876,3 +1936,510 @@ int debug_menu_overlay(void)
+     DebugRoomChange_Draw();
+     return 1;
+ }
++
++#if defined(RE1_PORT_BENCH)
++// ============================================================================
++// r-esp32-evil: OPTIONS > BENCHMARK - the room tour.
++//
++// Visits every room that ships an RDT through the same synthetic door record
++// as ROOM CHANGE above (door animation, room load, placement at the paired
++// door), to look for stalls and slow rooms on the target. While it runs
++// (g_re1benchActive):
++//   - room scripts and events do not run (game_loop, room_set), so no
++//     cutscene, movie or scripted fight starts; NPCs are not drawn
++//   - the player stands still (PlayerPad_Update publishes a blank pad) and is
++//     invisible and invincible (the EXTRAS cheats), so enemies leave them be
++//   - the camera follows the tour, not the player's position
++// LEFT/RIGHT: previous / next room, UP/DOWN: next / previous camera,
++// ACTION: auto on/off (every camera of every room in turn), CANCEL: back to
++// the room the tour started in, then normal play.
++// Each room's numbers go to the console ("[BENCH] ..."), and a summary when
++// the tour ends. The tour moves the mansion's stage-variant flag and marks
++// rooms visited like ROOM CHANGE does: load a save to play on afterwards.
++// ============================================================================
++extern "C" int  re1port_cheat(int which);
++extern "C" void re1port_set_cheat(int which, int on);
++extern "C" long re1t_heap_free(void);
++extern "C" long re1t_heap_largest(void);
++extern "C" void re1port_set_status(const char* line1, const char* line2);   // MarniDX_SW.cpp
++
++int g_re1benchActive = 0;           // read by game_loop, room_set, PlayerPad_Update
++int g_re1portGameplayFrames = 0;    // gameplay frames so far (the port menu: "in play?")
++int g_re1benchLoadMs = 0;           // room data + first background of the last load (DoorSystem.cpp)
++
++#define BENCH_MAX_ROOMS   256
++#define BENCH_MAX_CAMS    32
++#define BENCH_AUTO_CAM_MS 2000      // auto: time on each camera
++#define BENCH_HITCH_MS    100       // a frame slower than this is a hitch
++
++static unsigned short s_benchList[BENCH_MAX_ROOMS];   // stage << 8 | room
++static int   s_benchCount = -1;     // -1 = not scanned yet
++static int   s_benchPos = 0;
++static int   s_benchHome = -1;      // where the tour started (CANCEL returns there)
++int          g_re1benchRequest = 0;    // 1 = tour from this room, 2 = auto tour; from the
++                                       // title it starts a new game (TitleScreen.cpp)
++static int   s_benchAuto = 0;
++static int   s_benchAutoLeft = 0;   // rooms the auto run still has to visit
++static int   s_benchLoading = 0;    // a transition is running
++static int   s_benchEnding = 0;     // ...and it is the way home
++static int   s_benchJumpHex = 0;    // re1bench_goto: the room asked for (hex id)
++static int   s_benchJumpMode = 1;
++static int   s_benchJumpPending = 0;
++static int   s_benchJumpCam = 0;    // re1bench_camera: the camera asked for, 1-based as
++                                   // the band counts them (0 = as the door leaves it)
++static int   s_benchCamPending = 0; // ...in the room on screen, now
++static int   s_benchStopPending = 0;
++static int   s_benchPrevKeys = 0;
++static int   s_benchSavedCheat[2] = { 0, 0 };
++static int   s_benchSavedVariant = 0;
++static DWORD s_benchStart = 0, s_benchTrigger = 0, s_benchLast = 0, s_benchCamSince = 0;
++
++// The room on screen.
++static int   s_benchCams[BENCH_MAX_CAMS];
++static int   s_benchCamCount = 0, s_benchCamIdx = 0;
++static int   s_benchRoomOn = 0;     // its numbers are being gathered
++static int   s_benchRoomLoad = 0, s_benchRoomDoor = 0;
++static unsigned s_benchFrames = 0;
++static DWORD s_benchFrameMs = 0, s_benchWorst = 0, s_benchCutMax = 0;
++static int   s_benchHitches = 0;
++
++// The whole run.
++static int   s_benchVisited = 0, s_benchHitchRooms = 0, s_benchHitchTotal = 0;
++static long  s_benchLoadSum = 0;
++static int   s_benchSlowLoad = -1, s_benchSlowLoadAt = 0;
++static int   s_benchLowFps10 = 100000, s_benchLowFpsAt = 0;
++static int   s_benchWorstFrame = -1, s_benchWorstFrameAt = 0;
++static int   s_benchSlowCut = -1, s_benchSlowCutAt = 0;
++
++static int BenchRoomHex(int entry)
++{
++    return ((entry >> 8) + 1) * 0x100 + (entry & 0xFF);
++}
++
++static const char* BenchRoomName(int entry)
++{
++    const int stage = entry >> 8, room = entry & 0xFF;
++    if (stage >= DBG_STAGE_COUNT || room >= s_dbgStageRooms[stage].count) return "";
++    return s_dbgStageRooms[stage].names[room];
++}
++
++// Does the room ship a real RDT for the current character? (A few names in
++// the tables are 4-byte placeholders on disc.)
++static int BenchRoomFileOk(int stage, int room)
++{
++    static const char hexDigits[] = "0123456789abcdef";
++    const int variant = (g_main_state_flags & MSF_CHAR_VARIANT) ? 1 : 0;
++    char path[64], resolved[260], normalized[260];
++    sprintf(path, GAME_DATA_ROOT "stage%c\\room%c%c%c%c.rdt", hexDigits[stage + 1],
++            hexDigits[stage + 1], hexDigits[room >> 4], hexDigits[room & 0xF], hexDigits[variant]);
++    const char* filePath = ResolveAssetRoot(path, resolved, sizeof(resolved));
++    filePath = plat_normalize_path(filePath, normalized, sizeof(normalized));
++    FILE* fp = fopen(filePath, "rb");
++    if (fp == NULL) return 0;
++    fseek(fp, 0, SEEK_END);
++    const long size = ftell(fp);
++    fclose(fp);
++    return size > 0x94 + 0x100;
++}
++
++static void BenchBuildList(void)
++{
++    const DWORD t0 = plat_time_ms();
++    s_benchCount = 0;
++    for (int stage = 0; stage < DBG_STAGE_COUNT; stage++) {
++        for (int room = 0; room < s_dbgStageRooms[stage].count; room++) {
++            if (s_benchCount < BENCH_MAX_ROOMS && DebugRoomSelectable(stage, room) &&
++                BenchRoomFileOk(stage, room)) {
++                s_benchList[s_benchCount++] = (unsigned short)((stage << 8) | room);
++            }
++        }
++    }
++    fprintf(stderr, "[BENCH] %d rooms to visit (list built in %lu ms)\n", s_benchCount,
++            (unsigned long)(plat_time_ms() - t0));
++}
++
++static int BenchFind(int stage, int room)
++{
++    for (int i = 0; i < s_benchCount; i++) {
++        if (s_benchList[i] == ((stage << 8) | room)) return i;
++    }
++    return -1;
++}
++
++// display_room_camera_bg walks the switch-zone table with no bound, so only
++// cameras that own a group are offered (a few rooms have cutscene-only ones).
++// The table ends with camTo 0xFFFF.
++static int BenchCamHasGroup(int cam)
++{
++    if (g_RdtPointer == NULL || g_RdtPointer->cam_switch_zones == NULL) return 0;
++    const CAM_SWITCH_ZONE* zone = (const CAM_SWITCH_ZONE*)g_RdtPointer->cam_switch_zones;
++    for (int i = 0; i < 1024; i++, zone++) {
++        if ((unsigned short)zone->camTo == 0xFFFF) return 0;
++        if ((unsigned short)zone->camFrom == (unsigned short)cam) return 1;
++    }
++    return 0;
++}
++
++// "1234 KB free, largest 512 KB" (targets that report it), else "".
++static const char* BenchHeap(void)
++{
++    static char text[48];
++    const long freeKb = re1t_heap_free() / 1024, largestKb = re1t_heap_largest() / 1024;
++    if (freeKb > 0) sprintf(text, ", heap %ld KB free (largest %ld KB)", freeKb, largestKb);
++    else text[0] = 0;
++    return text;
++}
++
++static void BenchFinishRoom(void)
++{
++    if (!s_benchRoomOn) return;
++    s_benchRoomOn = 0;
++    const int entry = s_benchList[s_benchPos];
++    const int fps10 = s_benchFrameMs > 0 ? (int)(s_benchFrames * 10000u / s_benchFrameMs) : 0;
++    fprintf(stderr, "[BENCH]   %X: %d.%d fps over %u frames, worst frame %lu ms, %d hitches,"
++            " slowest camera cut %lu ms\n", BenchRoomHex(entry), fps10 / 10, fps10 % 10,
++            s_benchFrames, (unsigned long)s_benchWorst, s_benchHitches,
++            (unsigned long)s_benchCutMax);
++
++    s_benchVisited++;
++    s_benchLoadSum += s_benchRoomLoad;
++    if (s_benchRoomLoad > s_benchSlowLoad) { s_benchSlowLoad = s_benchRoomLoad; s_benchSlowLoadAt = entry; }
++    if (s_benchFrames >= 10 && fps10 < s_benchLowFps10) { s_benchLowFps10 = fps10; s_benchLowFpsAt = entry; }
++    if ((int)s_benchWorst > s_benchWorstFrame) { s_benchWorstFrame = (int)s_benchWorst; s_benchWorstFrameAt = entry; }
++    if ((int)s_benchCutMax > s_benchSlowCut) { s_benchSlowCut = (int)s_benchCutMax; s_benchSlowCutAt = entry; }
++    if (s_benchHitches > 0) { s_benchHitchRooms++; s_benchHitchTotal += s_benchHitches; }
++}
++
++static void BenchSummary(const char* how)
++{
++    if (s_benchVisited == 0) return;
++    fprintf(stderr, "[BENCH] ===== room tour %s: %d rooms in %lu s =====\n", how, s_benchVisited,
++            (unsigned long)((plat_time_ms() - s_benchStart) / 1000));
++    fprintf(stderr, "[BENCH] load: average %ld ms, slowest %d ms (%X %s)\n",
++            s_benchLoadSum / s_benchVisited, s_benchSlowLoad, BenchRoomHex(s_benchSlowLoadAt),
++            BenchRoomName(s_benchSlowLoadAt));
++    if (s_benchLowFps10 < 100000) {
++        fprintf(stderr, "[BENCH] lowest frame rate: %d.%d fps (%X %s)\n", s_benchLowFps10 / 10,
++                s_benchLowFps10 % 10, BenchRoomHex(s_benchLowFpsAt), BenchRoomName(s_benchLowFpsAt));
++    }
++    fprintf(stderr, "[BENCH] worst frame: %d ms (%X %s); slowest camera cut: %d ms (%X %s)\n",
++            s_benchWorstFrame, BenchRoomHex(s_benchWorstFrameAt), BenchRoomName(s_benchWorstFrameAt),
++            s_benchSlowCut, BenchRoomHex(s_benchSlowCutAt), BenchRoomName(s_benchSlowCutAt));
++    fprintf(stderr, "[BENCH] hitches (frames over %d ms): %d in %d rooms%s\n",
++            BENCH_HITCH_MS, s_benchHitchTotal, s_benchHitchRooms, BenchHeap());
++}
++
++static void BenchCameraTo(int n);
++
++// Start gathering numbers for the room that is on screen now.
++static void BenchEnterRoom(DWORD now)
++{
++    for (int j = 0; j < 8; j++) {
++        g_ScdEventTable[j].active = 0;      // nothing queued by the room's init runs
++    }
++    s_benchCamCount = 0;
++    s_benchCamIdx = 0;
++    const int cams = g_RdtPointer != NULL ? g_RdtPointer->cameras_count : 0;
++    for (int c = 0; c < cams && s_benchCamCount < BENCH_MAX_CAMS; c++) {
++        if (BenchCamHasGroup(c)) {
++            if (c == g_roomCameraId) s_benchCamIdx = s_benchCamCount;
++            s_benchCams[s_benchCamCount++] = c;
++        }
++    }
++    s_benchFrames = 0;
++    s_benchFrameMs = s_benchWorst = s_benchCutMax = 0;
++    s_benchHitches = 0;
++    s_benchRoomOn = 1;
++    s_benchLast = now;
++    s_benchCamSince = now;
++
++    const int entry = s_benchList[s_benchPos];
++    fprintf(stderr, "[BENCH] %d/%d %X %s: load %d ms (with door %d ms), %d cameras%s\n",
++            s_benchPos + 1, s_benchCount, BenchRoomHex(entry), BenchRoomName(entry),
++            s_benchRoomLoad, s_benchRoomDoor, s_benchCamCount, BenchHeap());
++    if (s_benchJumpCam > 0) {               // re1bench_camera before the jump
++        const int n = s_benchJumpCam;
++        s_benchJumpCam = 0;
++        s_benchCamPending = 0;
++        BenchCameraTo(n);
++    }
++}
++
++static void BenchGo(void)
++{
++    BenchFinishRoom();
++    const int entry = s_benchList[s_benchPos];
++    s_dbgStage = entry >> 8;
++    s_dbgRoom = entry & 0xFF;
++    s_benchLoaded = 0;
++    s_benchLoading = 1;
++    s_benchTrigger = plat_time_ms();
++    DebugRoomChange_Trigger();
++}
++
++static void BenchStep(int dir)
++{
++    BenchFinishRoom();                      // logged under the room being left
++    s_benchPos = (s_benchPos + dir + s_benchCount) % s_benchCount;
++    BenchGo();
++}
++
++static void BenchCamera(int dir)
++{
++    if (s_benchCamCount <= 1) return;
++    s_benchCamIdx = (s_benchCamIdx + dir + s_benchCamCount) % s_benchCamCount;
++    const int cam = s_benchCams[s_benchCamIdx];
++    const DWORD t0 = plat_time_ms();
++    g_roomCameraId = (unsigned char)cam;
++    StMask(0, 4);                           // as check_camera_switch's cut
++    display_room_camera_bg();
++    const DWORD now = plat_time_ms();
++    const DWORD ms = now - t0;
++    if (ms > s_benchCutMax) s_benchCutMax = ms;
++    s_benchLast = now;                      // the cut is timed on its own
++    s_benchCamSince = now;
++    fprintf(stderr, "[BENCH]   camera %d: cut %lu ms\n", cam, (unsigned long)ms);
++}
++
++// To the n-th of the room's cameras, 1-based as the band counts them.
++static void BenchCameraTo(int n)
++{
++    if (n < 1 || n > s_benchCamCount) {
++        fprintf(stderr, "[BENCH] camera %d: the room has %d\n", n, s_benchCamCount);
++        return;
++    }
++    if (n - 1 != s_benchCamIdx) BenchCamera(n - 1 - s_benchCamIdx);
++}
++
++static void BenchStop(const char* how)
++{
++    BenchFinishRoom();
++    BenchSummary(how);
++    re1port_set_cheat(0, s_benchSavedCheat[0]);
++    re1port_set_cheat(1, s_benchSavedCheat[1]);
++    g_re1benchActive = 0;
++    s_benchAuto = 0;
++    s_benchLoading = 0;
++    s_benchEnding = 0;
++}
++
++static void BenchStart(int mode)
++{
++    if (s_benchCount < 0) BenchBuildList();
++    if (s_benchCount <= 0) {
++        fprintf(stderr, "[BENCH] no rooms found\n");
++        return;
++    }
++    const DWORD now = plat_time_ms();
++    s_benchSavedCheat[0] = re1port_cheat(0);
++    s_benchSavedCheat[1] = re1port_cheat(1);
++    s_benchSavedVariant = Flg_ck((int)g_ScenarioFlags, SCENARIO_FLAG_STAGE_VARIANT) != 0;
++    re1port_set_cheat(0, 1);
++    re1port_set_cheat(1, 1);
++    g_re1benchActive = 1;
++    s_benchStart = now;
++    s_benchVisited = s_benchHitchRooms = s_benchHitchTotal = 0;
++    s_benchLoadSum = 0;
++    s_benchSlowLoad = s_benchWorstFrame = s_benchSlowCut = -1;
++    s_benchLowFps10 = 100000;
++    s_benchPrevKeys = DebugMenu_SampleKeys();   // the key that started it is still down
++    s_benchHome = BenchFind(g_stageId, g_roomId);
++    s_benchAuto = (mode == 2);
++    s_benchAutoLeft = s_benchCount;
++    s_benchRoomLoad = s_benchRoomDoor = 0;
++    fprintf(stderr, "[BENCH] room tour started (%s)\n", s_benchAuto ? "auto" : "manual");
++    // Where to begin: a room asked for by name (re1bench_goto, the
++    // RE1_BENCH_START=<hex> environment variable on the host), else the room
++    // the player is in (ROOM TOUR) or the first room (AUTO TOUR).
++    int hex = s_benchJumpHex;
++    s_benchJumpHex = 0;
++    if (hex == 0) {
++        if (const char* env = getenv("RE1_BENCH_START")) hex = (int)strtol(env, NULL, 16);
++        if (s_benchJumpCam == 0) {
++            if (const char* env = getenv("RE1_BENCH_CAM")) s_benchJumpCam = atoi(env);
++        }
++    }
++    int first = -1;
++    if (hex != 0) {
++        first = BenchFind((hex >> 8) - 1, hex & 0xFF);
++        if (first < 0) fprintf(stderr, "[BENCH] room %X is not in the list\n", hex);
++    }
++    if (first < 0) first = (mode == 1 && s_benchHome >= 0) ? s_benchHome : 0;
++    s_benchPos = first;
++    if (first == s_benchHome) {
++        BenchEnterRoom(now);
++    } else {
++        BenchGo();
++    }
++}
++
++void re1bench_request(int mode)
++{
++    g_re1benchRequest = mode;
++}
++
++// A room by its hex id (0x112 = ROOM 112; 0 = the list's first): straight
++// there on a running tour, else the tour starts there - from the title with a
++// new game (TitleScreen.cpp). Called on the game thread (re1_remote_poll).
++void re1bench_goto(int hexRoom, int mode)
++{
++    s_benchJumpHex = hexRoom;
++    if (g_re1benchActive) {
++        s_benchJumpMode = mode;
++        s_benchJumpPending = 1;
++    } else {
++        g_re1benchRequest = mode;
++    }
++}
++
++// The n-th camera (1-based, as the band counts them) of the room a pending
++// re1bench_goto lands in; with no jump pending on a running tour, of the room
++// on screen, at once. Call it after re1bench_goto.
++void re1bench_camera(int n)
++{
++    s_benchJumpCam = n;
++    s_benchCamPending = (g_re1benchActive && !s_benchJumpPending && !s_benchLoading) ? 1 : 0;
++}
++
++void re1bench_stop(void)
++{
++    g_re1benchRequest = 0;
++    if (g_re1benchActive) s_benchStopPending = 1;
++}
++
++// CANCEL: back to the room the tour started in, then normal play. 1 while a
++// transition home runs.
++static int BenchEnd(void)
++{
++    s_benchAuto = 0;
++    if (s_benchHome >= 0 && s_benchHome != s_benchPos) {
++        BenchFinishRoom();
++        s_benchEnding = 1;
++        s_benchPos = s_benchHome;
++        BenchGo();
++        return 1;
++    }
++    BenchStop("ended");
++    return 0;
++}
++
++// Called by game_loop on every gameplay frame. 1 while the tour runs.
++int re1bench_frame(void)
++{
++    g_re1portGameplayFrames++;
++    if (g_re1benchRequest != 0) {
++        const int mode = g_re1benchRequest;
++        g_re1benchRequest = 0;
++        if (!g_re1benchActive) BenchStart(mode);
++        return g_re1benchActive;
++    }
++    if (!g_re1benchActive) return 0;
++
++    const DWORD now = plat_time_ms();
++    if (s_benchLoading) {
++        if (!s_benchLoaded) return 1;       // the old room's frames before the door
++        s_benchLoading = 0;
++        s_benchRoomLoad = g_re1benchLoadMs;
++        s_benchRoomDoor = (int)(now - s_benchTrigger);
++        if (s_benchEnding) {
++            if (!s_benchSavedVariant) {     // the player's own mansion again
++                FUN_00473f10((int*)g_ScenarioFlags, SCENARIO_FLAG_STAGE_VARIANT);
++            } else {
++                Flg_on((int)g_ScenarioFlags, SCENARIO_FLAG_STAGE_VARIANT);
++            }
++            BenchStop("ended");
++            return 0;
++        }
++        BenchEnterRoom(now);
++    } else if (s_benchRoomOn) {
++        const DWORD dt = now - s_benchLast;
++        s_benchFrames++;
++        s_benchFrameMs += dt;
++        if (dt > s_benchWorst) s_benchWorst = dt;
++        if (dt > BENCH_HITCH_MS) {
++            // Counted always; logged only for the first few of a room (a slow
++            // room is slow every frame - the room's summary line says so).
++            if (++s_benchHitches <= 3) {
++                fprintf(stderr, "[BENCH]   hitch: %lu ms frame\n", (unsigned long)dt);
++            }
++        }
++    }
++    s_benchLast = now;
++
++    if ((g_main_state_flags & MSF_PLAYER_DEAD) != 0) {
++        BenchStop("stopped (player dead)");
++        return 0;
++    }
++
++    const int keys = DebugMenu_SampleKeys();
++    const int newKeys = keys & ~s_benchPrevKeys;
++    s_benchPrevKeys = keys;
++
++    if ((newKeys & DBGKEY_ESC) || s_benchStopPending) {
++        s_benchStopPending = 0;
++        return BenchEnd();
++    }
++    if (s_benchCamPending && !s_benchJumpPending) {   // re1bench_camera alone
++        s_benchCamPending = 0;
++        const int n = s_benchJumpCam;
++        s_benchJumpCam = 0;
++        BenchCameraTo(n);
++    }
++    if (s_benchJumpPending) {                // re1bench_goto on a running tour
++        s_benchJumpPending = 0;
++        const int hex = s_benchJumpHex;
++        s_benchJumpHex = 0;
++        const int at = hex != 0 ? BenchFind((hex >> 8) - 1, hex & 0xFF) : 0;
++        if (at >= 0 && at == s_benchPos && s_benchJumpCam > 0 && s_benchJumpMode == 1) {
++            const int n = s_benchJumpCam;     // the room on screen: only the camera
++            s_benchJumpCam = 0;
++            BenchCameraTo(n);
++            return 1;
++        }
++        if (at >= 0) {
++            s_benchAuto = (s_benchJumpMode == 2);
++            s_benchAutoLeft = s_benchCount;
++            BenchFinishRoom();
++            s_benchPos = at;
++            BenchGo();
++            return 1;
++        }
++        fprintf(stderr, "[BENCH] room %X is not in the list\n", hex);
++    }
++    if (newKeys & DBGKEY_CONFIRM) {
++        s_benchAuto = !s_benchAuto;
++        s_benchAutoLeft = s_benchCount;
++        s_benchCamSince = now;
++        fprintf(stderr, "[BENCH] auto %s\n", s_benchAuto ? "on" : "off");
++    }
++    if (newKeys & DBGKEY_RIGHT) { BenchStep(1);  return 1; }
++    if (newKeys & DBGKEY_LEFT)  { BenchStep(-1); return 1; }
++    if (newKeys & DBGKEY_UP)    BenchCamera(1);
++    if (newKeys & DBGKEY_DOWN)  BenchCamera(-1);
++
++    if (s_benchAuto && now - s_benchCamSince >= BENCH_AUTO_CAM_MS) {
++        if (s_benchCamIdx + 1 < s_benchCamCount) {
++            BenchCamera(1);
++        } else if (--s_benchAutoLeft <= 0) {
++            BenchFinishRoom();
++            BenchSummary("finished");
++            s_benchAuto = 0;
++            s_benchRoomOn = 0;              // numbers for the next room only
++        } else {
++            BenchStep(1);
++            return 1;
++        }
++    }
++
++    // The room's name and where the tour is, on a dark band at the bottom of
++    // the frame (drawn by the port's renderer, not the game's text layer, so
++    // the overlay does not weigh on the numbers it shows).
++    const int entry = s_benchList[s_benchPos];
++    char line1[40], line2[40];
++    snprintf(line1, sizeof(line1), "%X %s", BenchRoomHex(entry), BenchRoomName(entry));
++    snprintf(line2, sizeof(line2), "CAM %d/%d %d/%d%s", s_benchCamIdx + 1, s_benchCamCount,
++             s_benchPos + 1, s_benchCount, s_benchAuto ? " AUTO" : "");
++    re1port_set_status(line1, line2);
++    return 1;
++}
++#endif  // RE1_PORT_BENCH
+diff --git a/src/game/DoorSystem.cpp b/src/game/DoorSystem.cpp
+index f97c969..4c42561 100644
+--- a/src/game/DoorSystem.cpp
++++ b/src/game/DoorSystem.cpp
+@@ -47,6 +47,13 @@
+ #include "FileLoader.h"
+ #include "saturn/SaturnBattle.h"
+ #include "../system/HdTextures.h"   // door texture names (port-only)
++#if defined(RE1_PORT_BENCH)
++#include "../platform/platform.h"    // plat_time_ms (port-only)
++#endif
++
++#if defined(RE1_PORT_BENCH)
++extern int g_re1benchLoadMs;        // OPTIONS > BENCHMARK room tour (DebugMenu.cpp)
++#endif
+ 
+ // --- forward declarations of port-side helpers ---------------------------------
+ extern int  PSXObject_Store(CMarniDirect3DTMD* self, int* tmdHdr, int objIndex,
+@@ -1562,6 +1569,9 @@ void room_transition_load(void)
+     // +5 variants; armed by room scripts / save data, never by ported code). A
+     // stage change needs the heavier init_room, which re-points the stage data
+     // and BGM tables first.
++#if defined(RE1_PORT_BENCH)
++    DWORD benchT0 = plat_time_ms();     // OPTIONS > BENCHMARK: load time
++#endif
+     if ((flags & 0x80) == 0) {
+         BuildEnemySnap();
+         g_AttractMode_RoomCameraId = g_roomId;
+@@ -1583,6 +1593,10 @@ void room_transition_load(void)
+         }
+     }
+ 
++#if defined(RE1_PORT_BENCH)
++    g_re1benchLoadMs = (int)(plat_time_ms() - benchT0);
++#endif
++
+     g_AttractModeIdleTimer = 1;
+     // Waits for the door-animation task to clear bit 0x4000000. That task is not
+     // spawned yet, so nothing sets the bit and this falls straight through.
+@@ -1592,6 +1606,9 @@ void room_transition_load(void)
+ 
+     // 0x0048156c: put the newly loaded room on screen. The camera-only branch has no
+     // new data to build, so it re-runs the zone test instead.
++#if defined(RE1_PORT_BENCH)
++    benchT0 = plat_time_ms();
++#endif
+     if ((flags & 0x80) == 0) {
+         Room_SetupCamera();
+         load_room_bg_image();
+@@ -1599,6 +1616,9 @@ void room_transition_load(void)
+     } else {
+         check_camera_switch(1);
+     }
++#if defined(RE1_PORT_BENCH)
++    g_re1benchLoadMs += (int)(plat_time_ms() - benchT0);   // + the first background
++#endif
+ 
+     update_room_bgm();
+     if ((flags & 0x40) == 0) {
+diff --git a/src/game/EffectSprites.cpp b/src/game/EffectSprites.cpp
+index 6cfaf7a..c7a1793 100644
+--- a/src/game/EffectSprites.cpp
++++ b/src/game/EffectSprites.cpp
+@@ -6,6 +6,10 @@
+ // (0x0047d020), the global weapon-FX sheet loader core00.esp/.etm
+ // (0x0045fa80) and InitRoomEffSprite (0x0047b9b0). The behaviour dispatchers
+ // live in EffectSystem.cpp, which indexes the tables declared here.
++#include "../PortMem.h"
++#if defined(RE1_PORT_TEXTURE_PAL8)
++extern "C" void re1port_texture_hint(int paletteArt);   // port/marni/MarniDX_SW.cpp
++#endif
+ #include "../Globals.h"
+ #include "FileLoader.h"
+ #include "SpriteRenderer.h"
+@@ -595,6 +599,51 @@ static void load_effect_sprites(void)
+ 
+     // Composite each declared room sprite into its page buffer (CLUT row 0 -
+     // the base palette, uploaded to SRV 11-14 as before).
++#if defined(RE1_SMALL_MEM)
++    // r-esp32-evil: composite and upload ONE page at a time - 256 KB of scratch
++    // instead of 1 MB (+1 MB of HD reference pages). The pages are independent,
++    // so the uploads are identical to the loops below. The HD reference pages
++    // are not built: HD textures are off on the board (RE1_NO_HD_TEXTURES).
++    {
++        Re1Scratch<DWORD> pageBuf(256 * 256);
++        for (unsigned int row = 0; row < 4 && (DWORD*)pageBuf != NULL; row++) {
++            bool anyRow = false;
++            for (int i = 0; i < 4; i++) {
++                memset((DWORD*)pageBuf, 0, 256 * 256 * sizeof(DWORD));
++                for (unsigned int slot = 0; slot < 8; slot++) {
++                    unsigned char type = g_abEffSpriteIndexTable[8 + slot];
++                    if (type == 0xFF) continue;
++                    unsigned char sheetSlot = g_effectSpriteSheetSlot[type];
++                    if (sheetSlot == 0xFF) continue;
++                    unsigned int page = sheetSlot - 8;
++                    if (page >= 4) continue;
++                    if (row > 0 && (unsigned int)g_effectSpriteClutRows[type] <= row) continue;
++                    if (row > 0) anyRow = true;
++                    if ((int)page != i) continue;
++                    blit_effect_tim_at(pageBuf, (const unsigned char*)DAT_00ac9cd0[slot],
++                                       g_effectSpritePageV[type], row);
++                }
++                bool hasContent = false;
++                for (int px = 0; px < 256 * 256; px++) {
++                    if (pageBuf[px] != 0) { hasContent = true; break; }
++                }
++                if (!hasContent) continue;
++                int slot = row == 0 ? 11 + i : 152 + i * 4 + (int)row - 1;
++#if defined(RE1_PORT_TEXTURE_PAL8)
++                re1port_texture_hint(1);   // palette art: 8-bit storage in the backend
++#endif
++                MarniCreateTexture(256, 256, 32, (DWORD*)pageBuf, &g_TexturePageSRV[slot]);
++#if defined(RE1_PORT_TEXTURE_PAL8)
++                re1port_texture_hint(0);
++#endif
++                g_TexturePageWidth[slot] = 256;
++                g_TexturePageHeight[slot] = 256;
++                g_TexturePageBpp[slot] = 16;
++            }
++            if (row > 0 && !anyRow) break;
++        }
++    }
++#else
+     static DWORD s_pageBuffer[4][256 * 256];
+     for (int i = 0; i < 4; i++) {
+         memset(s_pageBuffer[i], 0, sizeof(s_pageBuffer[i]));
+@@ -690,6 +739,8 @@ static void load_effect_sprites(void)
+         }
+     }
+ 
++#endif  // RE1_SMALL_MEM
++
+     // The weapon-FX sheets 4-7 (blood, ember, glass, 0xb) live on the page-1
+     // Effspr file, which is a per-room palette variant (esp001 base / esp2xx).
+     // The OG re-loads that page every room, so re-bake those four SRVs from
+@@ -791,7 +842,10 @@ static int BakeWeaponSheetFromPage(int slot, const char* pageName)
+     }
+     if (nextV < height + pageV) height = (unsigned short)(nextV - pageV);
+ 
+-    static DWORD rgba[256 * 256];
++    RE1_SCRATCH(DWORD, rgba, 256 * 256);
++#if defined(RE1_SMALL_MEM)
++    if ((DWORD*)rgba == NULL) return 0;   // out of memory: keep the old sheet
++#endif
+     const unsigned char* pix = p;
+     for (unsigned short y = 0; y < height; y++) {
+         const unsigned char* src = pix + (pageV + y) * pixW;
+@@ -818,7 +872,13 @@ static int BakeWeaponSheetFromPage(int slot, const char* pageName)
+     char hdKey[160];
+     HdRegionScope hdSource(HdTextures_KeyForPath(path, hdKey, sizeof(hdKey)),
+                            0, pageV, 256, height, 256, 256);
++#if defined(RE1_PORT_TEXTURE_PAL8)
++    re1port_texture_hint(1);
++#endif
+     MarniCreateTexture(256, height, 32, rgba, &g_TexturePageSRV[srvSlot]);
++#if defined(RE1_PORT_TEXTURE_PAL8)
++    re1port_texture_hint(0);
++#endif
+     g_TexturePageWidth[srvSlot] = 256;
+     g_TexturePageHeight[srvSlot] = height;
+     g_TexturePageBpp[srvSlot] = 8;
+diff --git a/src/game/FileLoader.cpp b/src/game/FileLoader.cpp
+index eb4b984..c5a87a8 100644
+--- a/src/game/FileLoader.cpp
++++ b/src/game/FileLoader.cpp
+@@ -1,6 +1,7 @@
+ // FileLoader.cpp - Asset file loading implementation
+ // Original function: LoadFile at 0x00411e10 (Ghidra)
+ // Handles fopen/fread with retry logic and path resolution
++#include <stdlib.h>
+ #include "../Globals.h"
+ #include "../platform/platform.h"
+ #include "../system/AssetPath.h"
+@@ -160,7 +161,27 @@ static int pak_decomp_decode_string(int startPos, unsigned int code)
+ // src: pointer to compressed PAK data
+ // dst: pointer to output buffer for decompressed data
+ // Returns: number of bytes written to dst
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: the 137 KB LZW dictionary exists only while a .pak unpacks,
++// in the port's reserved block for big temporaries when that is free (it is
++// at every camera cut) - no fresh 137 KB block to find on a fragmented heap.
++#include "../PortMem.h"
++static int unpack_pakfile_impl(void* src, void* dst);
+ int unpack_pakfile_(void* src, void* dst)
++{
++    const size_t bytes = sizeof(PakDictEntry) * PAK_DICT_ENTRIES;
++    g_pakDict = (PakDictEntry*)re1port_big_alloc(bytes);
++    if (g_pakDict == NULL) return 0;
++    memset(g_pakDict, 0, bytes);
++    int n = unpack_pakfile_impl(src, dst);
++    re1port_big_free(g_pakDict);
++    g_pakDict = NULL;
++    return n;
++}
++static int unpack_pakfile_impl(void* src, void* dst)
++#else
++int unpack_pakfile_(void* src, void* dst)
++#endif
+ {
+     int outPos = 0;
+     g_pakDecompInputPos = 0;
+diff --git a/src/game/GameLoop.cpp b/src/game/GameLoop.cpp
+index 8a04443..749b0c5 100644
+--- a/src/game/GameLoop.cpp
++++ b/src/game/GameLoop.cpp
+@@ -13,6 +13,7 @@
+ // Returns: 0 = game completed (chains to ending_state), 1 = died/quit (chains to title_state)
+ // Called by: game_start (0x00480710)
+ // ============================================================================
++#include "../PortProf.h"
+ #include "../Globals.h"
+ #include "../marni/MarniInput.h"
+ #include <cstdio>
+@@ -26,6 +27,21 @@
+ #include "saturn/SaturnTyrant.h"
+ #include "GameOptions.h"
+ 
++#if defined(RE1_PORT_BENCH)
++// r-esp32-evil OPTIONS > BENCHMARK room tour (DebugMenu.cpp).
++extern int g_re1benchActive;
++extern int g_re1benchRequest;       // a tour about to start: its room stays quiet too
++int re1bench_frame(void);
++#define RE1_BENCH_ON() (g_re1benchActive != 0 || g_re1benchRequest != 0)
++// NPCs (ids 0x14/0x15 and 0x17 up; 0x16 is the DC's forest zombie) are not
++// drawn on the tour: only the player and the monsters.
++#define RE1_BENCH_HIDES(e) (g_re1benchActive != 0 && \
++    ((e)->id == 0x14 || (e)->id == 0x15 || (e)->id >= 0x17))
++#else
++#define RE1_BENCH_ON() 0
++#define RE1_BENCH_HIDES(e) 0
++#endif
++
+ // Forward declarations for functions only used within game_loop
+ extern void FUN_00473f10(int* baseAddr, unsigned int bitIndex);
+ extern void run_command_functions(unsigned short* scd_opcodes);
+@@ -199,13 +215,19 @@ LAB_00480d7c:
+                 // fires the script's event branch (fade-out, cutscene) the
+                 // moment a bit is toggled, blacking the background.
+                 // g_debugMenuOpen stays 0 while debug features are disabled.
+-                if (g_debugMenuOpen == 0) {
++                //
++                // r-esp32-evil OPTIONS > BENCHMARK room tour: the room's
++                // scripts and events stay off as well (no cutscenes).
++                if (g_debugMenuOpen == 0 && !RE1_BENCH_ON()) {
++                    RE1_PROF(RE1_PROF_SCRIPTS);
+                     run_command_functions((unsigned short*)g_RoomScdOpcodes);
+                     room_events_check();
+                     room_state_reset();
+ 
+                     // 0x00480d98: Check interactive screen display
+                     check_and_display_interactive_screen();
++                } else if (g_debugMenuOpen == 0) {
++                    room_state_reset();
+                 }
+ 
+                 // 0x00480d9d-0x00480dcd: Handle game reset request (F9 key)
+@@ -219,7 +241,9 @@ LAB_00480d7c:
+ 
+                 // 0x00480dcd-0x00480de8: Camera zone switching
+                 if ((g_main_state_flags & MSF_CAMERA_REDRAW) == 0) {
+-                    check_camera_switch(0);
++                    if (!RE1_BENCH_ON()) {      // the room tour picks the camera
++                        check_camera_switch(0);
++                    }
+                 } else {
+                     g_main_state_flags &= ~MSF_CAMERA_REDRAW;
+                     display_room_camera_bg();
+@@ -273,6 +297,13 @@ LAB_00480d7c:
+                 } else {
+                     g_debugMenuOpen = 0;
+                 }
++#if defined(RE1_PORT_BENCH)
++                // r-esp32-evil OPTIONS > BENCHMARK: the room tour's frame
++                // (input, camera, room changes, its overlay). DebugMenu.cpp.
++                if (g_debugMenuOpen == 0) {
++                    re1bench_frame();
++                }
++#endif
+                 if (((g_playerEntity.isBeingAttackedFlag == 0) &&
+                      ((g_message_flags & 0x100) != 0) &&
+                      ((g_message_flags & 0x40) != 0) &&
+@@ -302,6 +333,7 @@ LAB_00480e89:
+                 // Debug menu open: pause entity/enemy updates while it is up.
+                 // g_debugMenuOpen stays 0 while debug features are disabled.
+                 if (g_debugMenuOpen == 0) {
++                    RE1_PROF(RE1_PROF_ENEMIES);
+                     update_entities();
+                 }
+ 
+@@ -318,9 +350,12 @@ LAB_00480e89:
+                 }
+ 
+                 // 0x00480ebd-0x00480ecf: Player animation and position update
+-                update_player_anim();
+-                g_main_state_flags2 &= ~MSF2_EFFECT_ZONE;
+-                update_player_position(&g_playerEntity, 1);
++                {
++                    RE1_PROF(RE1_PROF_PLAYER);
++                    update_player_anim();
++                    g_main_state_flags2 &= ~MSF2_EFFECT_ZONE;
++                    update_player_position(&g_playerEntity, 1);
++                }
+ 
+                 // 0x00480ecf-0x00480f70: Screen effects, room objects, entity
+                 // and player rendering, 2D effects and room sprites.
+@@ -329,6 +364,7 @@ LAB_00480e89:
+                 // presented frame) and nothing draws on top of the menu.
+                 // g_debugMenuOpen stays 0 while debug features are disabled.
+                 if (g_debugMenuOpen == 0) {
++                    RE1_PROF(RE1_PROF_MODELS);
+                     DrawFadeSpr();
+                     if (g_bSaturnMode) saturn_room_objects_update();
+ 
+@@ -351,7 +387,7 @@ LAB_00480e89:
+                             entCount = entCount - 1;
+                             EntityComputeJointWorldMatrices(*(unsigned short*)&ENTITY->pad_ca);
+                             EntityApplyLookAtRotation();
+-                            if (g_dwEntityRenderEnabled != 0) {
++                            if (g_dwEntityRenderEnabled != 0 && !RE1_BENCH_HIDES(ENTITY)) {
+                                 render_entity(ENTITY);
+                             }
+                         }
+diff --git a/src/game/GameOptions.cpp b/src/game/GameOptions.cpp
+index 94e1e6e..fcc508f 100644
+--- a/src/game/GameOptions.cpp
++++ b/src/game/GameOptions.cpp
+@@ -78,6 +78,12 @@ enum {
+     PAGE_INPUT,
+     PAGE_GAME,
+     PAGE_BONUS,
++#if defined(RE1_PORT_EXTRAS)
++    PAGE_EXTRAS,     // r-esp32-evil: text size and cheats (in game)
++#endif
++#if defined(RE1_PORT_BENCH)
++    PAGE_BENCH,      // r-esp32-evil: room tour benchmark (in game)
++#endif
+     PAGE_COUNT
+ };
+ 
+@@ -547,6 +553,17 @@ static void page_root_ingame(unsigned int nav)
+     s_rowCount = 0;
+     opt_row("DISPLAY", "WINDOW MODE, RESOLUTION, VSYNC");
+     opt_row("INPUT",   "KEYBOARD AND GAMEPAD CONTROLS");
++    int kRowTitle = 2, kRowBack = 3;
++#if defined(RE1_PORT_EXTRAS)
++    opt_row("EXTRAS",  "TEXT SIZE, ITEMS, CHEATS, FPS COUNTER");
++    const int kRowExtras = kRowTitle;
++    kRowTitle++; kRowBack++;
++#endif
++#if defined(RE1_PORT_BENCH)
++    opt_row("BENCHMARK", "ROOM TOUR: LOAD TIMES AND FRAME RATE");
++    const int kRowBench = kRowTitle;
++    kRowTitle++; kRowBack++;
++#endif
+     opt_row("BACK TO TITLE", "UNSAVED PROGRESS IS LOST");
+     opt_row("BACK", "RETURN TO THE GAME");
+ 
+@@ -575,12 +592,20 @@ static void page_root_ingame(unsigned int nav)
+         s_done = 1;
+         opt_sfx(SFX_TITLE_CANCEL);
+     } else if (nav & NAV_CONFIRM) {
+-        if (*cursor == 2) {
++        if (*cursor == kRowTitle) {
+             s_confirmQuit = 1;
+             opt_sfx(SFX_TITLE_TYPE02);
+-        } else if (*cursor == 3) {
++        } else if (*cursor == kRowBack) {
+             s_done = 1;
+             opt_sfx(SFX_TITLE_CANCEL);
++#if defined(RE1_PORT_EXTRAS)
++        } else if (*cursor == kRowExtras) {
++            opt_goto(PAGE_EXTRAS);
++#endif
++#if defined(RE1_PORT_BENCH)
++        } else if (*cursor == kRowBench) {
++            opt_goto(PAGE_BENCH);
++#endif
+         } else {
+             opt_goto(PAGE_DISPLAY + *cursor);       // DISPLAY, INPUT
+         }
+@@ -590,7 +615,7 @@ static void page_root_ingame(unsigned int nav)
+     opt_draw_rows(*cursor, 288);
+     ingame_draw_session_info();
+     if (s_confirmQuit) {
+-        const int y = OPT_ROW_Y + 4 * OPT_ROW_PITCH + 8;
++        const int y = OPT_ROW_Y + (kRowBack + 1) * OPT_ROW_PITCH + 8;
+         opt_rect(OPT_ROW_X - 4, y - 4, 288 + 8, 40, 0x30, 40);
+         opt_text(OPT_ROW_X + 8, y, COL_SELECTED, "RETURN TO THE TITLE SCREEN?");
+         opt_text(OPT_ROW_X + 8,   y + 16, s_confirmQuit == 1 ? COL_SELECTED : COL_NORMAL,
+@@ -600,6 +625,178 @@ static void page_root_ingame(unsigned int nav)
+     }
+ }
+ 
++#if defined(RE1_PORT_EXTRAS)
++// ---------------------------------------------------------------------------
++// EXTRAS (r-esp32-evil, no original address): the port's text size and a few
++// cheats. The state lives in the port (port/common/Extras.cpp).
++// ---------------------------------------------------------------------------
++extern "C" float re1port_text_scale(int menuFont);
++extern "C" void  re1port_set_text_scale(int menuFont, float scale);
++extern "C" int   re1port_cheat(int which);              // 0 invincible, 1 invisible, 2 FPS
++extern "C" void  re1port_set_cheat(int which, int on);
++extern "C" int   re1port_give_item(int id, int qty);    // 1 = added, 0 = no free slot
++extern "C" void  re1port_full_heal(void);
++
++struct ExtraItem { unsigned char id; unsigned char qty; const char* name; };
++static const ExtraItem kExtraItems[] = {
++    { 0x02, 15, "BERETTA" },       { 0x03,  7, "SHOTGUN" },       { 0x05,  6, "COLT PYTHON" },
++    { 0x06, 100, "FLAMETHROWER" }, { 0x07,  6, "BAZOOKA" },       { 0x0A, 10, "R. LAUNCHER" },
++    { 0x0B, 15, "CLIP" },          { 0x0C,  7, "SHELLS" },        { 0x0E,  6, "MAGNUM ROUNDS" },
++    { 0x0F, 100, "FUEL" },         { 0x10,  6, "EXPLOSIVE R." },  { 0x11,  6, "ACID ROUNDS" },
++    { 0x12,  6, "FLAME ROUNDS" },  { 0x41,  1, "F.-AID SPRAY" },  { 0x42,  1, "SERUM" },
++    { 0x43,  1, "RED HERB" },      { 0x44,  1, "GREEN HERB" },    { 0x45,  1, "BLUE HERB" },
++    { 0x2F,  3, "INK RIBBON" },    { 0x30,  1, "LIGHTER" },       { 0x31,  1, "LOCKPICK" },
++    { 0x33,  1, "SWORD KEY" },     { 0x34,  1, "ARMOR KEY" },     { 0x35,  1, "SHIELD KEY" },
++    { 0x36,  1, "HELMET KEY" },    { 0x37,  1, "MASTER KEY" },    { 0x29,  1, "WIND CREST" },
++    { 0x2C,  1, "MOON CREST" },    { 0x2D,  1, "STAR CREST" },    { 0x2E,  1, "SUN CREST" },
++    { 0x1F,  1, "EMBLEM" },        { 0x24,  1, "WOLF MEDAL" },    { 0x25,  1, "EAGLE MEDAL" },
++    { 0x27,  1, "BATTERY" },       { 0x28,  1, "MO DISK" },       { 0x26,  1, "HERBICIDE" },
++};
++#define EXTRA_ITEM_COUNT ((int)(sizeof(kExtraItems) / sizeof(kExtraItems[0])))
++static int s_extraItem = 0;
++static int s_extraMsgTimer = 0;
++static const char* s_extraMsg = NULL;
++
++static const char* extra_scale_name(float s)
++{
++    return s < 1.25f ? "ORIGINAL" : (s < 1.75f ? "LARGE" : "X-LARGE");
++}
++
++static float extra_scale_step(float s, int step)
++{
++    static const float kScales[] = { 1.0f, 1.5f, 2.0f };
++    int i = s < 1.25f ? 0 : (s < 1.75f ? 1 : 2);
++    i = (i + 3 + step) % 3;
++    return kScales[i];
++}
++
++static void page_extras(unsigned int nav)
++{
++    s_rowCount = 0;
++    OptRow* r = opt_row("TEXT SIZE", "MESSAGES, ITEM NAMES AND DESCRIPTIONS");
++    opt_row_value(r, extra_scale_name(re1port_text_scale(0)), 1);
++    r = opt_row("MENU TEXT SIZE", "THE SMALL MENU FONT");
++    opt_row_value(r, extra_scale_name(re1port_text_scale(1)), 1);
++    r = opt_row("INVINCIBLE", "HEALTH IS REFILLED EVERY FRAME");
++    opt_row_value(r, re1port_cheat(0) ? "ON" : "OFF", 1);
++    r = opt_row("INVISIBLE", "ENEMIES DO NOT SEE OR SENSE YOU");
++    opt_row_value(r, re1port_cheat(1) ? "ON" : "OFF", 1);
++    r = opt_row("SHOW FPS", "FRAME RATE IN THE TOP-LEFT CORNER");
++    opt_row_value(r, re1port_cheat(2) ? "ON" : "OFF", 1);
++    r = opt_row("GIVE ITEM", "LEFT/RIGHT CHOOSE, ACTION ADDS IT");
++    opt_row_value(r, kExtraItems[s_extraItem].name, 1);
++    opt_row("FULL HEALTH", "RESTORE HEALTH NOW");
++    opt_row("BACK", NULL);
++
++    int* cursor = &s_cursor[PAGE_EXTRAS];
++    opt_move_cursor(cursor, nav);
++    const int step = (nav & NAV_RIGHT) ? 1 : (nav & NAV_LEFT) ? -1 : 0;
++    const int toggle = step != 0 || (nav & NAV_CONFIRM) != 0;
++    switch (*cursor) {
++    case 0:
++    case 1:
++        if (toggle) {
++            const int menu = *cursor;
++            re1port_set_text_scale(menu, extra_scale_step(re1port_text_scale(menu), step ? step : 1));
++            opt_sfx(SFX_TITLE_TYPE01);
++        }
++        break;
++    case 2:
++    case 3:
++    case 4:
++        if (toggle) {
++            const int which = *cursor - 2;
++            re1port_set_cheat(which, !re1port_cheat(which));
++            opt_sfx(SFX_TITLE_TYPE01);
++        }
++        break;
++    case 5:
++        if (step != 0) {
++            s_extraItem = (s_extraItem + EXTRA_ITEM_COUNT + step) % EXTRA_ITEM_COUNT;
++            opt_sfx(SFX_TITLE_TYPE01);
++        } else if (nav & NAV_CONFIRM) {
++            const ExtraItem& it = kExtraItems[s_extraItem];
++            if (re1port_give_item(it.id, it.qty)) {
++                s_extraMsg = "ADDED TO YOUR INVENTORY";
++                opt_sfx(SFX_TITLE_TYPE02);
++            } else {
++                s_extraMsg = "NO FREE INVENTORY SLOT";
++                opt_sfx(SFX_TITLE_CANCEL);
++            }
++            s_extraMsgTimer = 60;
++        }
++        break;
++    case 6:
++        if (nav & NAV_CONFIRM) {
++            re1port_full_heal();
++            s_extraMsg = "HEALTH RESTORED";
++            s_extraMsgTimer = 60;
++            opt_sfx(SFX_TITLE_TYPE02);
++        }
++        break;
++    case 7:
++        if (nav & NAV_CONFIRM) { opt_goto(PAGE_ROOT); return; }
++        break;
++    }
++    if (nav & NAV_CANCEL) { opt_goto(PAGE_ROOT); return; }
++
++    opt_draw_frame("OPTIONS - EXTRAS");
++    opt_draw_rows(*cursor, 288);
++    if (s_extraMsgTimer > 0 && s_extraMsg != NULL) {
++        --s_extraMsgTimer;
++        opt_text(OPT_ROW_X, OPT_ROW_Y + 9 * OPT_ROW_PITCH, COL_GOOD, "%s", s_extraMsg);
++    }
++}
++#endif  // RE1_PORT_EXTRAS
++
++#if defined(RE1_PORT_BENCH)
++// ---------------------------------------------------------------------------
++// BENCHMARK (r-esp32-evil, no original address): the room tour lives in
++// DebugMenu.cpp; this page only starts it and closes the menu.
++// ---------------------------------------------------------------------------
++void re1bench_request(int mode);    // 1 = from this room, 2 = auto from the first room
++
++static void page_bench(unsigned int nav)
++{
++    s_rowCount = 0;
++    opt_row("ROOM TOUR", "STARTS IN THIS ROOM, YOU STEP THROUGH");
++    opt_row("AUTO TOUR", "EVERY ROOM AND CAMERA, TIMES ON CONSOLE");
++    opt_row("BACK", NULL);
++
++    int* cursor = &s_cursor[PAGE_BENCH];
++    opt_move_cursor(cursor, nav);
++    if (nav & NAV_CONFIRM) {
++        if (*cursor == 0 || *cursor == 1) {
++            re1bench_request(*cursor + 1);
++            opt_sfx(SFX_TITLE_TYPE02);
++            s_done = 1;                 // back to the game, where the tour runs
++            return;
++        }
++        opt_goto(PAGE_ROOT);
++        return;
++    }
++    if (nav & NAV_CANCEL) { opt_goto(PAGE_ROOT); return; }
++
++    opt_draw_frame("OPTIONS - BENCHMARK");
++    opt_draw_rows(*cursor, 288);
++    // The tour's controls, under the rows.
++    static const char* const kHelp[][2] = {
++        { "LEFT/RIGHT", "ROOM" },
++        { "UP/DOWN",    "CAMERA" },
++        { "ACTION",     "AUTO ON/OFF" },
++        { "CANCEL",     "END, BACK TO THIS ROOM" },
++    };
++    int y = OPT_ROW_Y + 4 * OPT_ROW_PITCH;
++    opt_text(OPT_ROW_X, y, COL_TITLE, "DURING THE TOUR");
++    for (int i = 0; i < 4; i++) {
++        y += OPT_ROW_PITCH;
++        opt_text(OPT_ROW_X, y, COL_NORMAL, "%-11s%s", kHelp[i][0], kHelp[i][1]);
++    }
++    y += OPT_ROW_PITCH + 4;
++    opt_text(OPT_ROW_X, y, COL_DISABLED, "NO CUTSCENES, NO NPCS, NO ATTACKS");
++}
++#endif  // RE1_PORT_BENCH
++
+ // ---------------------------------------------------------------------------
+ // DISPLAY
+ // ---------------------------------------------------------------------------
+@@ -1506,6 +1703,12 @@ void ingame_options_menu(void)
+         switch (s_page) {
+         case PAGE_DISPLAY: page_display(nav);       break;
+         case PAGE_INPUT:   page_input(nav);         break;
++#if defined(RE1_PORT_EXTRAS)
++        case PAGE_EXTRAS:  page_extras(nav);        break;
++#endif
++#if defined(RE1_PORT_BENCH)
++        case PAGE_BENCH:   page_bench(nav);         break;
++#endif
+         default:           page_root_ingame(nav);   break;
+         }
+         Task_sleep(1);
+diff --git a/src/game/InputSystem.cpp b/src/game/InputSystem.cpp
+index e89273c..16a36b5 100644
+--- a/src/game/InputSystem.cpp
++++ b/src/game/InputSystem.cpp
+@@ -7,6 +7,10 @@
+ #include "../marni/MarniXInput.h"
+ #include <cstring>
+ 
++#if defined(RE1_PORT_BENCH)
++extern int g_re1benchActive;        // OPTIONS > BENCHMARK room tour (DebugMenu.cpp)
++#endif
++
+ // ============================================================================
+ // Pad default bindings (port addition)
+ //
+@@ -331,7 +335,13 @@ DWORD PlayerPad_Update(void)
+ 	// front of (ENTER/SPACE is the action key). The overlay itself samples
+ 	// the keyboard directly and is unaffected. g_debugMenuOpen stays 0 while
+ 	// debug features are disabled.
++	// r-esp32-evil: the OPTIONS > BENCHMARK room tour keeps the player still
++	// the same way (it reads g_RawPadHeld itself).
++#if defined(RE1_PORT_BENCH)
++	if (g_debugMenuOpen != 0 || g_re1benchActive != 0) {
++#else
+ 	if (g_debugMenuOpen != 0) {
++#endif
+ 		g_PlayerPadPressed = 0;
+ 		g_PlayerPadHeld = 0;
+ 		g_PlayerDpadHeld = 0;
+diff --git a/src/game/Ps1EndingCredits.cpp b/src/game/Ps1EndingCredits.cpp
+index d6153da..ce4e6ae 100644
+--- a/src/game/Ps1EndingCredits.cpp
++++ b/src/game/Ps1EndingCredits.cpp
+@@ -1,4 +1,5 @@
+ #include "Ps1EndingCredits.h"
++#include <stdlib.h>
+ 
+ #include "../DebugPrint.h"
+ #include "../Globals.h"
+@@ -134,10 +135,32 @@ static const WipeEvent kWipeEvents[2] = {
+ // GsSPRITE x = (0x20 << 16 >> 16) - 0xa0 about the 160,120 draw offset.
+ constexpr int kCreditsX = 32;
+ 
+-static BYTE s_staffBuffer[0x30000];
++#define RE1_STAFF_BUFFER_SIZE 0x30000
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: allocated on first use - the PS1 credits are an opt-in mode.
++static BYTE* s_staffBufferPtr = NULL;
++static BYTE* re1_staff_buffer(void)
++{
++    if (s_staffBufferPtr == NULL) s_staffBufferPtr = (BYTE*)malloc(RE1_STAFF_BUFFER_SIZE);
++    return s_staffBufferPtr;
++}
++#define s_staffBuffer (re1_staff_buffer())
++#else
++static BYTE s_staffBuffer[RE1_STAFF_BUFFER_SIZE];
++#endif
+ static BYTE s_bioBuffer[0x4000];
+ static std::vector<DWORD> s_atlas;
++#if defined(RE1_SMALL_MEM)
++static DWORD* s_bioPixelsPtr = NULL;
++static DWORD* re1_bio_pixels(void)
++{
++    if (s_bioPixelsPtr == NULL) s_bioPixelsPtr = (DWORD*)malloc(256 * 68 * sizeof(DWORD));
++    return s_bioPixelsPtr;
++}
++#define s_bioPixels (re1_bio_pixels())
++#else
+ static DWORD s_bioPixels[256 * 68];
++#endif
+ static MarniHandle s_stripTexture = MARNI_NULL_HANDLE;
+ static MarniHandle s_bioTexture = MARNI_NULL_HANDLE;
+ static int s_stripCount = 0;
+@@ -422,12 +445,12 @@ BOOL Ps1EndingCredits_Begin(int endingId, int characterId)
+                                 : GAME_DATA_ROOT "data\\staff.stf";
+     size_t staffSize = LoadFile(staffPath, s_staffBuffer, 0x20);
+     if ((staffSize == static_cast<size_t>(-1) ||
+-         staffSize > sizeof(s_staffBuffer)) && endingId <= 3) {
++         staffSize > RE1_STAFF_BUFFER_SIZE) && endingId <= 3) {
+         staffPath = GAME_DATA_ROOT "data\\staff.stf";
+         staffSize = LoadFile(staffPath, s_staffBuffer, 0x20);
+     }
+     if (staffSize == static_cast<size_t>(-1) ||
+-        staffSize > sizeof(s_staffBuffer)) {
++        staffSize > RE1_STAFF_BUFFER_SIZE) {
+         dbg_printf("[credits] missing %s\n", staffPath);
+         return FALSE;
+     }
+diff --git a/src/game/Rendering.cpp b/src/game/Rendering.cpp
+index 876469c..6eaf647 100644
+--- a/src/game/Rendering.cpp
++++ b/src/game/Rendering.cpp
+@@ -606,6 +606,7 @@ void FrameRateGovernor(void)
+             // buffer accumulates across frames and display_texture returns 0
+             // on overflow - every 2D effect stops rendering.
+             g_SpriteQueueCount = 0;
++            SPRITE_QUEUE_EMPTIED();
+ 
+             // Render the remaining low-depth pending sprites last (the screen
+             // fade overlays and colour tinting under depth 500; the
+@@ -1149,6 +1150,14 @@ void display_image(int slot, void* buffer, int width, int height)
+     }
+ 
+     int pixelCount = width * height;
++#if defined(RE1_PORT_TEXTURE_BGR555)
++    // r-esp32-evil: the software renderer takes the 15-bit PS1 pixels as they
++    // are (bpp 15 = opaque BGR555, the conversion below). This removes a 300 KB
++    // allocation on every camera cut, which a fragmented 8 MB heap could fail
++    // - and then the room showed no background at all.
++    MarniCreateTexture(width, height, 15, buffer, &g_displayImageSRV);
++    return;
++#endif
+     unsigned int* rgba = (unsigned int*)malloc(pixelCount * 4);
+     if (rgba == NULL) return;
+ 
+diff --git a/src/game/Room.cpp b/src/game/Room.cpp
+index 325aed0..db44a21 100644
+--- a/src/game/Room.cpp
++++ b/src/game/Room.cpp
+@@ -11,6 +11,23 @@
+ #include "RoomBackgroundWebp.h"
+ #include "../system/HdTextures.h"     // HdSourceScope (port-only)
+ 
++#if defined(RE1_BG_ON_DEMAND)
++// r-esp32-evil: per-camera background file names for on-demand loading.
++#define RE1_BG_MAX_CAMERAS 32
++static char s_re1BgCameraPath[RE1_BG_MAX_CAMERAS][64];
++static void re1_bg_note_camera_path(int cam, const char* path)
++{
++    if (cam < 0 || cam >= RE1_BG_MAX_CAMERAS) return;
++    strncpy(s_re1BgCameraPath[cam], path, sizeof(s_re1BgCameraPath[cam]) - 1);
++    s_re1BgCameraPath[cam][sizeof(s_re1BgCameraPath[cam]) - 1] = '\0';
++}
++static const char* re1_bg_camera_path(int cam)
++{
++    if (cam < 0 || cam >= RE1_BG_MAX_CAMERAS) cam = 0;
++    return s_re1BgCameraPath[cam];
++}
++#endif
++
+ extern void SetSpriteBufferFlag(void);
+ 
+ // ============================================================================
+@@ -954,7 +971,14 @@ void load_room_bg(void) // 0x00462b00
+                 int fileSize = 0;
+                 room_hd_note_bg(g_bgPathTemplate, camCounter - 1);   // port-only
+                 if (!room_bg_webp_preload(g_bgPathTemplate, camCounter - 1)) {
++#if defined(RE1_BG_ON_DEMAND)
++                    // r-esp32-evil: remember the camera's file instead of
++                    // caching every camera's .pak (768 KB); load_room_bg_image
++                    // reads it at the cut.
++                    re1_bg_note_camera_path(camCounter - 1, g_bgPathTemplate);
++#else
+                     fileSize = (int)LoadFile(g_bgPathTemplate, &g_bgCacheBuffer[totalSize], 2);
++#endif
+                 }
+                 totalSize += fileSize;
+             } while (camCounter < (int)(unsigned int)g_RdtPointer->cameras_count);
+@@ -1011,7 +1035,12 @@ void load_room_bg_image(void) // 0x004629c0
+         // here. Without it every camera showed the PREVIOUS camera's background
+         // (camera 6 rendered image 5) and camera 0 only looked correct because
+         // slot 0 is never written and happens to be 0.
++#if defined(RE1_BG_ON_DEMAND)
++        LoadFile(re1_bg_camera_path(g_roomCameraId), g_bgPakLoadBuffer, 2);
++        pakData = g_bgPakLoadBuffer;
++#else
+         pakData = &g_bgCacheBuffer[g_bgCameraOffsets[g_roomCameraId + 1]];
++#endif
+     }
+ 
+     unpack_pakfile_(pakData, g_TimImageBuffer);
+diff --git a/src/game/RoomInit.cpp b/src/game/RoomInit.cpp
+index e26d02e..6ec8819 100644
+--- a/src/game/RoomInit.cpp
++++ b/src/game/RoomInit.cpp
+@@ -36,6 +36,11 @@ extern void Room_LoadEnemySoundBanks(void);
+ #include "saturn/SaturnBattle.h"
+ #include "saturn/SaturnTick.h"     // the Tick's animator slots, freed per room
+ 
++#if defined(RE1_PORT_BENCH)
++extern int g_re1benchActive;        // OPTIONS > BENCHMARK room tour (DebugMenu.cpp)
++extern int g_re1benchRequest;       // ...and one about to start
++#endif
++
+ // Entity model loading functions from EntityModelLoader.cpp
+ extern void LoadEntityEMD(Entity* em, unsigned char entity_id);
+ extern void Entity_SetJoints(Entity* em, unsigned int param2);
+@@ -632,6 +637,15 @@ void room_set(void)
+     printf("after of Scenario check\n");
+ 
+     // 0x00477c45: room_events_check()
++#if defined(RE1_PORT_BENCH)
++    // r-esp32-evil OPTIONS > BENCHMARK room tour: whatever the init script
++    // queued (a cutscene) is dropped instead of started.
++    if (g_re1benchActive != 0 || g_re1benchRequest != 0) {
++        for (int j = 0; j < 8; j++) {
++            g_ScdEventTable[j].active = 0;
++        }
++    } else
++#endif
+     room_events_check();
+ 
+     // 0x00477c54: g_message_flags &= ~0x80
+diff --git a/src/game/SaveLoadScreen.cpp b/src/game/SaveLoadScreen.cpp
+index 4bf0ce1..11e815e 100644
+--- a/src/game/SaveLoadScreen.cpp
++++ b/src/game/SaveLoadScreen.cpp
+@@ -18,6 +18,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <ctime>
++#include <cerrno>
+ #include "../system/AssetPath.h"
+ 
+ extern void logos_state(void);
+@@ -435,9 +436,22 @@ static SaveScreenLayout GetSaveScreenLayout(void)
+ int FileWrite(const char* name, void* buf, int len)
+ {
+     FILE* fp = fopen(name, "wb");
++#if defined(RE1_PORT_EXTRAS)
++    // r-esp32-evil: a save that could not be written said nothing, here or on
++    // screen - the game only finds out when the slot reads back empty.
++    if (fp == NULL) {
++        fprintf(stderr, "[SAVE] %s: cannot create it (%s)\n", name, strerror(errno));
++        return -1;
++    }
++    size_t written = fwrite(buf, 1, len, fp);
++    const int closed = fclose(fp);
++    fprintf(stderr, "[SAVE] %s: %d of %d bytes%s\n", name, (int)written, len,
++            ((int)written != len || closed != 0) ? " - FAILED" : "");
++#else
+     if (fp == NULL) return -1;
+     size_t written = fwrite(buf, 1, len, fp);
+     fclose(fp);
++#endif
+     if ((int)written != len) return -1;
+     return len;
+ }
+@@ -968,8 +982,15 @@ void LoadSaveGameState(int mode, int flags, int useInkRibbon, int sfxBank, int c
+                 FILE* fp = fopen(g_saveFileName, "r");
+                 if (fp == NULL) {
+                     save_slots[slotIndex].hasData = 0;
++#if defined(RE1_PORT_EXTRAS)
++                    // r-esp32-evil: what the slot list is built from.
++                    fprintf(stderr, "[SAVE] list: %s - %s\n", g_saveFileName, strerror(errno));
++#endif
+                 } else {
+                     int scanSize = ReadSaveFile(g_saveFileName, saveBuffer);
++#if defined(RE1_PORT_EXTRAS)
++                    fprintf(stderr, "[SAVE] list: %s - %d bytes\n", g_saveFileName, scanSize);
++#endif
+ 
+                     save_slots[slotIndex].hasData       = 1;
+                     save_slots[slotIndex].characterId   = saveBuffer[OFFSET_CHARACTER_ID];
+diff --git a/src/game/SoundTables.cpp b/src/game/SoundTables.cpp
+index fb0f2bb..ec8c3ab 100644
+--- a/src/game/SoundTables.cpp
++++ b/src/game/SoundTables.cpp
+@@ -296,7 +296,15 @@ const char* g_StageVoiceNamesTable[8] = {
+ //
+ // Trailing NULL slots are omitted per row; C zero-fills the remainder.
+ // ============================================================
+-static const char* g_RoomSndData[203][48] = {
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: never written, but its pointers are not const, so the table
++// would sit in .data - 39 KB of the target's scarce internal RAM. A rodata
++// section puts it in flash with its type unchanged.
++#define RE1_ROOM_SND_SECTION __attribute__((section(".rodata.g_RoomSndData")))
++#else
++#define RE1_ROOM_SND_SECTION
++#endif
++static const char* g_RoomSndData[203][48] RE1_ROOM_SND_SECTION = {
+     /*   0  stage 0 room  0 */ {
+         NULL, NULL, NULL, NULL, NULL, NULL,
+         NULL, NULL, NULL, NULL, NULL, NULL,
+diff --git a/src/game/SpriteRenderer.cpp b/src/game/SpriteRenderer.cpp
+index 60af3a8..ed8695f 100644
+--- a/src/game/SpriteRenderer.cpp
++++ b/src/game/SpriteRenderer.cpp
+@@ -1,3 +1,4 @@
++#include "../PortProf.h"
+ #include "SpriteRenderer.h"
+ #include "../Globals.h"
+ #include "../DebugPrint.h"
+@@ -89,6 +90,7 @@ int AddSpriteCallback(SpriteDrawCallback fn, unsigned int depthSort)
+ // ============================================================================
+ void SpriteQueue_Reset(void) {
+     g_SpriteQueueCount = 0;
++    SPRITE_QUEUE_EMPTIED();
+     g_OTIndex = 0;
+     g_renderPrimCount = 0;
+ }
+@@ -108,12 +110,30 @@ void SpriteQueue_Reset(void) {
+ // letting them out here as well would draw them twice - and on top of the
+ // player, which is the bug this split exists to fix.
+ // ============================================================================
++#if defined(RE1_PORT_FAST)
++// r-esp32-evil: the queue as last found in order - its length and three of
++// its keys. Every writer appends, so while the length is unchanged nothing
++// has moved; the places that empty the queue clear this (SPRITE_QUEUE_EMPTIED).
++// FlushTmdObjects calls the flush once per mask depth, and re-checking the
++// order read every command each time - a cache miss each on the target, the
++// model pass having evicted them in between.
++static int          s_sortedCount = -1;
++static unsigned int s_sortedKey[3];
++
++void SpriteQueue_ForgetOrder(void)
++{
++    s_sortedCount = -1;
++}
++#endif
++
+ void FlushSpriteCommandsRange(unsigned int minDepth, unsigned int maxDepth,
+                               unsigned int classMask)
+ {
+     if (g_SpriteQueueCount == 0) {
+         return;
+     }
++    RE1_PROF(RE1_PROF_SPRSORT);
++    RE1_WORK(RE1_WORK_RANGE_FLUSHES, 1);
+ 
+     // 0x0046d...: Emulate the PS1 ordering table (OT). The original GPU linked
+     // primitives by Z-depth so that a LOWER depthSort value rendered ON TOP
+@@ -123,12 +143,36 @@ void FlushSpriteCommandsRange(unsigned int minDepth, unsigned int maxDepth,
+     // Stable sort so equal-depth draws keep their submission order. The two
+     // range flushes (FrameRateGovernor) each re-sort the untouched queue, so
+     // both halves come out in the same global order.
++    auto nearerLast = [](const TextureDraw& a, const TextureDraw& b) {
++        return a.depthSort > b.depthSort;
++    };
++#if defined(RE1_PORT_FAST)
++    // r-esp32-evil: FlushTmdObjects flushes the queue once per mask depth, so
++    // the same untouched queue arrives here many times a frame. A stable sort
++    // leaves a sorted array as it is: checking costs one pass, the sort a
++    // temporary buffer from the heap and n log n moves - and once checked, the
++    // queue stays in order until it grows or is emptied.
++    {
++        const int n = g_SpriteQueueCount;
++        const TextureDraw* q = g_SpriteCommandBuffer;
++        const bool known = n == s_sortedCount && q[0].depthSort == s_sortedKey[0] &&
++                           q[n / 2].depthSort == s_sortedKey[1] &&
++                           q[n - 1].depthSort == s_sortedKey[2];
++        if (!known) {
++            if (!std::is_sorted(g_SpriteCommandBuffer, g_SpriteCommandBuffer + n, nearerLast))
++                std::stable_sort(g_SpriteCommandBuffer, g_SpriteCommandBuffer + n, nearerLast);
++            s_sortedCount = n;
++            s_sortedKey[0] = q[0].depthSort;
++            s_sortedKey[1] = q[n / 2].depthSort;
++            s_sortedKey[2] = q[n - 1].depthSort;
++        }
++    }
++#else
+     std::stable_sort(
+         g_SpriteCommandBuffer,
+         g_SpriteCommandBuffer + g_SpriteQueueCount,
+-        [](const TextureDraw& a, const TextureDraw& b) {
+-            return a.depthSort > b.depthSort;
+-        });
++        nearerLast);
++#endif
+ 
+     CMarniDirect3D* pD3D = (CMarniDirect3D*)g_pMarniDirect3D;
+     (void)pD3D;
+@@ -137,7 +181,35 @@ void FlushSpriteCommandsRange(unsigned int minDepth, unsigned int maxDepth,
+     float scaleX, scaleY;
+     MarniGetRenderScale(&scaleX, &scaleY);
+ 
+-    for (int i = 0; i < g_SpriteQueueCount; i++) {
++    int first = 0;
++#if defined(RE1_PORT_FAST)
++    // r-esp32-evil: the queue is sorted far to near now, so the commands in
++    // [minDepth, maxDepth) are one run of it - found by two binary searches
++    // instead of testing every command, which FlushTmdObjects' once-per-mask-
++    // depth calls made a full walk of the queue each. Every writer appends,
++    // so a command a callback adds while this runs sits past the sorted
++    // part and is tested one by one below, exactly as before.
++    const int sortedCount = g_SpriteQueueCount;
++    int runEnd = sortedCount;
++    {
++        TextureDraw* b = g_SpriteCommandBuffer;
++        TextureDraw* e = b + sortedCount;
++        TextureDraw* lo = std::partition_point(
++            b, e, [maxDepth](const TextureDraw& c) { return c.depthSort >= maxDepth; });
++        TextureDraw* hi = std::partition_point(
++            lo, e, [minDepth](const TextureDraw& c) { return c.depthSort >= minDepth; });
++        first = (int)(lo - b);
++        runEnd = (int)(hi - b);
++    }
++#endif
++
++    for (int i = first; i < g_SpriteQueueCount; i++) {
++#if defined(RE1_PORT_FAST)
++        if (i == runEnd && runEnd < sortedCount) {
++            i = sortedCount;                  // the rest of the sorted part is nearer
++            if (i >= g_SpriteQueueCount) break;
++        }
++#endif
+         TextureDraw* cmd = &g_SpriteCommandBuffer[i];
+         if (cmd->depthSort < minDepth || cmd->depthSort >= maxDepth) continue;
+         if ((cmd->sortClass & classMask) == 0) continue;
+@@ -395,6 +467,7 @@ void FlushSpriteCommands(void) {
+ 
+     FlushSpriteCommandsRange(0, 0xFFFFFFFFu, SPRITE_CLASS_ALL);
+     g_SpriteQueueCount = 0;
++    SPRITE_QUEUE_EMPTIED();
+ }
+ int draw_texture(TextureDesc* texture, unsigned short depth) {
+     if (g_SpriteQueueCount >= MAX_SPRITE_COMMANDS - 1) return 0;
+diff --git a/src/game/SpriteRenderer.h b/src/game/SpriteRenderer.h
+index fe402c6..83fb2c0 100644
+--- a/src/game/SpriteRenderer.h
++++ b/src/game/SpriteRenderer.h
+@@ -207,6 +207,14 @@ static inline float SpriteDrawAlpha(float variantAlpha) {
+     return (variantAlpha == 0.0f) ? 1.0f : variantAlpha;
+ }
+ void SpriteQueue_Reset(void);
++#if defined(RE1_PORT_FAST)
++// r-esp32-evil: FlushSpriteCommandsRange remembers that the queue it sorted
++// is in order; every place that empties the queue must say so.
++void SpriteQueue_ForgetOrder(void);
++#define SPRITE_QUEUE_EMPTIED() SpriteQueue_ForgetOrder()
++#else
++#define SPRITE_QUEUE_EMPTIED() ((void)0)
++#endif
+ void FlushSpriteCommands(void);
+ void FlushSpriteCommandsRange(unsigned int minDepth, unsigned int maxDepth,
+                               unsigned int classMask = SPRITE_CLASS_NORMAL);
+diff --git a/src/game/TaskScheduler.cpp b/src/game/TaskScheduler.cpp
+index cc690e6..15828fc 100644
+--- a/src/game/TaskScheduler.cpp
++++ b/src/game/TaskScheduler.cpp
+@@ -186,6 +186,47 @@ static void TaskSwitch_Resume(void)
+     ReturnToScheduler_Resume();
+ }
+ 
++#elif defined(RE1_PORT_TASKSWITCH_EXTERNAL)
++
++// ============================================================================
++// Externally provided switch primitives (r-esp32-evil port).
++//
++// Targets without ucontext (ESP-IDF / FreeRTOS on Xtensa) supply the three
++// primitives themselves; the contract is the ucontext one below: Start runs a
++// fresh task body on slot `id` until it yields, Resume continues it where it
++// yielded, Yield (called on the task) hands control back to the scheduler.
++// A slot that is restarted (Task_chain / a dead slot re-executed) is simply
++// started again: the port discards whatever was left of the old body, exactly
++// as makecontext discards the old ucontext.
++// ============================================================================
++extern "C" void re1port_task_start(int id, void (*entry)(void));
++extern "C" void re1port_task_resume(int id);
++extern "C" void re1port_task_yield(int id);
++
++void Task_exit(void);
++
++static void TaskEntry(void)
++{
++    void (*fn)(void) = (void (*)(void))g_TasksEIP[g_CurrentTaskID];
++    fn();
++    Task_exit();
++}
++
++static void TaskSwitch_Start(void)
++{
++    re1port_task_start(g_CurrentTaskID, TaskEntry);
++}
++
++static void TaskSwitch_Resume(void)
++{
++    re1port_task_resume(g_CurrentTaskID);
++}
++
++static void TaskYield(void)
++{
++    re1port_task_yield(g_CurrentTaskID);
++}
++
+ #else  // !(MSVC x86)
+ 
+ // ============================================================================
+diff --git a/src/game/TextureLoader.cpp b/src/game/TextureLoader.cpp
+index 9325985..23b840d 100644
+--- a/src/game/TextureLoader.cpp
++++ b/src/game/TextureLoader.cpp
+@@ -12,6 +12,28 @@
+ #include <string>
+ #include <vector>
+ 
++#if defined(RE1_PORT_VRAM16)
++// r-esp32-evil: 16-bit pixels, bit 15 = opaque, bits 0-14 BGR555 (red low).
++#define RE1_BPP_KEYED15 0x1D9
++#endif
++
++#if defined(RE1_PORT_TEXTURE_INDEXED)
++// r-esp32-evil: a texture the software backend builds itself from PS1 indexed
++// pixels (4 or 8 bpp, nibble-packed low first) and a 15-bit CLUT.
++#define RE1_BPP_INDEXED 0x1D8
++struct Re1IndexedPixels {
++    const void*           pixels;
++    const unsigned short* clut;
++    int                   bpp;
++};
++#endif
++
++#if defined(RE1_PORT_TEXT_SCALE)
++// r-esp32-evil: implemented by the software renderer (port/marni/MarniDX_SW.cpp).
++extern "C" void re1port_font_upload_begin(void);
++extern "C" void re1port_font_upload_end(MarniHandle font);
++#endif
++
+ #undef LoadImage  // Win32 WinUser.h macro conflicts with Marni LoadImage
+ 
+ // ============================================================================
+@@ -132,6 +154,35 @@ void LoadEffectTextureSheet(int slot, void* timData)
+ {
+     if (slot < 0 || slot >= 256) return;
+ 
++#if defined(RE1_PORT_TEXTURE_INDEXED)
++    // r-esp32-evil: hand the indexed pixels and the CLUT straight to the
++    // backend, which applies the same rule as EffectTextureSheet_BuildRGBA
++    // (colour 0x0000 = clear). Every camera cut rebuilds the room's mask page
++    // here, and the 256 KB RGBA copy it otherwise needs is the largest
++    // allocation a fragmented 8 MB heap is asked for during play.
++    if (!HdTextures_Active() && timData != NULL) {
++        PSXTexture psxTex;
++        if (psxTex.Store((int*)timData, 1) != 0 && psxTex.m_pPixelData != NULL &&
++            psxTex.m_pCLUTData != NULL && (psxTex.m_BitDepth == 4 || psxTex.m_BitDepth == 8) &&
++            psxTex.m_WidthPixels > 0 && psxTex.m_Height > 0) {
++            Re1IndexedPixels desc;
++            desc.pixels = psxTex.m_pPixelData;
++            desc.clut = psxTex.m_pCLUTData;
++            desc.bpp = psxTex.m_BitDepth;
++            if (g_TexturePageSRV[slot] != MARNI_NULL_HANDLE) {
++                Marni_DX()->DestroyTexture(g_TexturePageSRV[slot]);
++                g_TexturePageSRV[slot] = MARNI_NULL_HANDLE;
++            }
++            MarniCreateTexture(psxTex.m_WidthPixels, psxTex.m_Height, RE1_BPP_INDEXED, &desc,
++                               &g_TexturePageSRV[slot]);
++            g_TexturePageWidth[slot] = psxTex.m_WidthPixels;
++            g_TexturePageHeight[slot] = psxTex.m_Height;
++            g_TexturePageBpp[slot] = psxTex.m_BitDepth;
++            return;
++        }
++    }
++#endif
++
+     HdBufferScope hdSource(timData);   // port-only (HdTextures.h)
+     int w = 0, h = 0, bpp = 0;
+     DWORD* rgba = EffectTextureSheet_BuildRGBA(timData, &w, &h, &bpp);
+@@ -623,7 +674,15 @@ void ProcessTextureImage(void* imageBuffer, short textureBankID, short pageOffse
+             if (useDirect) {
+                 // Port-only: the HD 8x8 font draws in this page's glyph colour.
+                 HdText_NoteFontPage((const unsigned int*)rgbaOut, w, h);
++#if defined(RE1_PORT_TEXT_SCALE)
++                // r-esp32-evil: the software renderer keeps the font at full
++                // resolution and lays text out itself (bigger, re-wrapped).
++                re1port_font_upload_begin();
++#endif
+                 MarniCreateTexture(w, h, 32, rgbaOut, &pD3D->m_FontTexHandle);
++#if defined(RE1_PORT_TEXT_SCALE)
++                re1port_font_upload_end(pD3D->m_FontTexHandle);
++#endif
+                 delete[] rgbaOut;
+                 delete[] clutRGBA;
+             } else {
+@@ -1536,8 +1595,21 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+     #define VRAM_PAGE_H 256
+     #define VRAM_PAGE_MAX_SLOTS 64
+     #define VRAM_MAX_DESTS 16
++#if defined(RE1_PORT_VRAM16)
++    // r-esp32-evil: the page is kept as 16-bit "keyed" pixels (bit 15 set =
++    // opaque, bits 0-14 BGR555 like the source; 0 = clear) - 128 KB instead of
++    // 256 KB per page, and the alpha here is only ever 0 or 255 anyway.
++    typedef WORD VramPx;
++#define RE1_VRAM_PX(r5, g5, b5, opaque) \
++    ((opaque) ? (WORD)(0x8000 | ((b5) << 10) | ((g5) << 5) | (r5)) : (WORD)0)
++#else
++    typedef DWORD VramPx;
++#define RE1_VRAM_PX(r5, g5, b5, opaque) \
++    (((opaque) ? 0xFF000000u : 0u) | ((DWORD)((b5) * 255 / 31) << 16) | \
++     ((DWORD)((g5) * 255 / 31) << 8) | (DWORD)((r5) * 255 / 31))
++#endif
+     struct VRAMPage {
+-        DWORD* rgba;
++        VramPx* rgba;
+         int destSlots[VRAM_MAX_DESTS];
+         int numDests;
+     };
+@@ -1551,7 +1623,8 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+     if (srcData != 0 && bpp == 2 && (int)width > 0 && (int)height > 0 && vramIdx >= 0 && vramIdx < VRAM_PAGE_MAX_SLOTS) {
+         VRAMPage* vp = &s_vramPages[vramIdx];
+         if (vp->rgba == NULL) {
+-            vp->rgba = new DWORD[VRAM_PAGE_W * VRAM_PAGE_H]();
++            vp->rgba = new VramPx[VRAM_PAGE_W * VRAM_PAGE_H]();
++            if (vp->rgba == NULL) return;   // out of memory (board): no icons
+             vp->numDests = 0;
+         }
+ 
+@@ -1565,7 +1638,7 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+             }
+         }
+ 
+-        DWORD* page = vp->rgba;
++        VramPx* page = vp->rgba;
+         int dstX = ((int)x & 0x3F) * 2;
+         int dstY = (int)y;
+ 
+@@ -1608,11 +1681,8 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+                 for (int col = 0; col < pixW; col++) {
+                     BYTE idx = src8[row * pixW + col];
+                     WORD clr = clutPalette[idx];
+-                    DWORD r = ((clr >> 0)  & 0x1F) * 255 / 31;
+-                    DWORD g = ((clr >> 5)  & 0x1F) * 255 / 31;
+-                    DWORD b = ((clr >> 10) & 0x1F) * 255 / 31;
+-                    DWORD a = (idx == 0) ? 0x00 : 0xFF;
+-                    DWORD rgba = (a << 24) | (b << 16) | (g << 8) | r;
++                    VramPx rgba = RE1_VRAM_PX(clr & 0x1F, (clr >> 5) & 0x1F, (clr >> 10) & 0x1F,
++                                              idx != 0);
+                     int px = dstX + col;
+                     int py = dstY + row;
+                     if (px >= 0 && px < VRAM_PAGE_W && py >= 0 && py < VRAM_PAGE_H) {
+@@ -1628,11 +1698,8 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+             for (int row = 0; row < h; row++) {
+                 for (int col = 0; col < w; col++) {
+                     WORD pixel = pixels[row * w + col];
+-                    DWORD r = ((pixel >> 0)  & 0x1F) * 255 / 31;
+-                    DWORD g = ((pixel >> 5)  & 0x1F) * 255 / 31;
+-                    DWORD b = ((pixel >> 10) & 0x1F) * 255 / 31;
+-                    DWORD a = (r == 0 && g == 0 && b == 0) ? 0x00 : 0xFF;
+-                    DWORD rgba = (a << 24) | (b << 16) | (g << 8) | r;
++                    VramPx rgba = RE1_VRAM_PX(pixel & 0x1F, (pixel >> 5) & 0x1F,
++                                              (pixel >> 10) & 0x1F, (pixel & 0x7FFF) != 0);
+                     for (int sx = 0; sx < 2; sx++) {
+                         int px = dstX + col * 2 + sx;
+                         int py = dstY + row;
+@@ -1647,7 +1714,11 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+         // Port-only: the page at HD size when one of its icons has a picture.
+         std::vector<DWORD> hdPage;
+         int hdSize = 0;
++#if defined(RE1_PORT_VRAM16)
++        const bool hd = false;   // HD textures are off on the board
++#else
+         const bool hd = ComposeHdIconPage(page, s_vramIcons[vramIdx], &hdPage, &hdSize);
++#endif
+         for (int d = 0; d < vp->numDests; d++) {
+             int slot = vp->destSlots[d];
+             if (slot >= 0 && slot < 256) {
+@@ -1659,7 +1730,12 @@ void LoadImage(int srcData, int srcSlot, int dstSlot, short format,
+                     g_TexturePageSRV[slot] = Marni_DX()->CreateTexture(hdSize, hdSize, 32,
+                                                                        hdPage.data(), NULL, NULL);
+                 if (g_TexturePageSRV[slot] == MARNI_NULL_HANDLE)
++#if defined(RE1_PORT_VRAM16)
++                    MarniCreateTexture(VRAM_PAGE_W, VRAM_PAGE_H, RE1_BPP_KEYED15, page,
++                                       &g_TexturePageSRV[slot]);
++#else
+                     MarniCreateTexture(VRAM_PAGE_W, VRAM_PAGE_H, 32, page, &g_TexturePageSRV[slot]);
++#endif
+                 g_TexturePageWidth[slot] = VRAM_PAGE_W;
+                 g_TexturePageHeight[slot] = VRAM_PAGE_H;
+                 g_TexturePageBpp[slot] = 16;
+diff --git a/src/game/TitleScreen.cpp b/src/game/TitleScreen.cpp
+index 290788e..13cc7e9 100644
+--- a/src/game/TitleScreen.cpp
++++ b/src/game/TitleScreen.cpp
+@@ -14,6 +14,10 @@
+ #include "GameOptions.h"
+ #include "../system/AssetPath.h"
+ 
++#if defined(RE1_PORT_BENCH)
++extern int g_re1benchRequest;       // OPTIONS > BENCHMARK / port menu room tour (DebugMenu.cpp)
++#endif
++
+ extern void logos_state(void);
+ 
+ // ============================================================================
+@@ -1097,6 +1101,9 @@ void title_state(void)
+     do {
+         update_title_options();
+         Task_sleep(1);
++#if defined(RE1_PORT_BENCH)
++        if (g_re1benchRequest != 0) break;      // the port menu asked for a room tour
++#endif
+     } while (g_titleLoopFlag != 0);
+ 
+     // legacy gpu wait
+@@ -1113,6 +1120,23 @@ void title_state(void)
+         cleanup_texture_slot(TITLE_MENU_SLOT);
+     }
+ 
++#if defined(RE1_PORT_BENCH)
++    // r-esp32-evil: the port menu's ROOM TOUR / AUTO TOUR from the title. A
++    // new game as Chris, as the character select's confirm starts one but
++    // without the intro movie; the tour takes over on its first frame
++    // (re1bench_frame), and until then the first room's events stay off.
++    if (g_re1benchRequest != 0) {
++        nullsub_0047eb80();
++        g_SelectedCharactedId = 0;
++        g_main_state_flags &= ~(MSF_CHAR_VARIANT | MSF_CONTINUE_GAME);
++        g_main_state_flags2 &= ~MSF2_ATTRACT_DEMO;
++        g_bGameActive = 2;
++        sounds_reset();
++        Task_chain((void*)game_start);
++        return;
++    }
++#endif
++
+     // OPTIONS: a state of its own, which chains back here when it is left.
+     if (g_titleSelectionId == TITLE_OPTIONS_ITEM) {
+         Task_chain((void*)game_options_state);
+diff --git a/src/game/TmdRenderer.cpp b/src/game/TmdRenderer.cpp
+index 8597e93..fe7ff2a 100644
+--- a/src/game/TmdRenderer.cpp
++++ b/src/game/TmdRenderer.cpp
+@@ -26,6 +26,10 @@
+ // {x,y,z, nx,ny,nz, r,g,b, u,v}, m_pIndexBuffer holds WORD indices
+ // (3 per triangle, 4 per quad in PS1 order 0,1,3,2). Both position and normal
+ // have Y negated by PSXObject_Store (PS1 +Y is down, D3D +Y is up).
++#include "../PortProf.h"
++#if defined(RE1_PORT_FAST)
++#include "re1_fastmath.h"
++#endif
+ #include "TmdRenderer.h"
+ #include "SpriteRenderer.h"
+ #include "../Globals.h"
+@@ -66,9 +70,21 @@ extern void FUN_00483580(int* joint, MATRIX* out);          // 0x00483580 item_v
+ // frame in FlushTmdObjects because the fov changes with the camera.
+ #define TMD_NEAR_Z          (1.0f)
+ #define TMD_FAR_Z      (131072.0f)    // depth-buffer range; every scene z fits
++#if defined(RE1_SMALL_MEM)
++#define TMD_MAX_QUEUE       1024      // r-esp32-evil: objects queued per frame
++#else
+ #define TMD_MAX_QUEUE       2048
++#endif
++#if defined(RE1_SMALL_MEM)
++#define TMD_MAX_TRIS_FLUSH  256       // r-esp32-evil: smaller batches, same output
++#else
+ #define TMD_MAX_TRIS_FLUSH  1024      // MarniDX::DrawTriangles3D per-call cap
++#endif
++#if defined(RE1_TMD_MAX_TRIS_COLLECT)
++#define TMD_MAX_TRIS_COLLECT RE1_TMD_MAX_TRIS_COLLECT   // r-esp32-evil: sized per target
++#else
+ #define TMD_MAX_TRIS_COLLECT 8192     // per-frame triangle pool for the depth sort
++#endif
+ 
+ // View-space Z -> normalised [0,1] depth for the depth buffer. Linear: a D24
+ // buffer over TMD_FAR_Z still resolves better than a hundredth of a world unit,
+@@ -122,8 +138,24 @@ struct TmdLightState {
+     float dir[3][3];   // g_d3dLightData[i*12 + 3..5]
+     float col[3][3];   // g_d3dLightData[i*12 + 6..8]
+     DWORD ambient;     // g_d3dAmbientColor
++#if defined(RE1_PORT_FAST)
++    float amb[3];      // r-esp32-evil: `ambient` as TmdComputeLight's floats, made
++                       // once per object instead of three divides per vertex
++#endif
+ };
+ 
++#if defined(RE1_PORT_FAST)
++static inline void TmdLightAmbient(TmdLightState* ls)
++{
++    ls->amb[0] = (float)((ls->ambient >> 16) & 0xFF) / 255.0f;
++    ls->amb[1] = (float)((ls->ambient >> 8)  & 0xFF) / 255.0f;
++    ls->amb[2] = (float)( ls->ambient        & 0xFF) / 255.0f;
++}
++#define TMD_LIGHT_AMBIENT(ls) TmdLightAmbient(ls)
++#else
++#define TMD_LIGHT_AMBIENT(ls) ((void)0)
++#endif
++
+ // Pinned so a change here cannot silently grow the .bss footprint unnoticed.
+ // 20 rather than 16 since the geometry element is now carried explicitly: the
+ // complex-object pool (FUN_00486df0) keeps its elements outside any TMD slot,
+@@ -158,6 +190,18 @@ struct TmdTri {
+ };
+ static TmdTri g_tmdTris[TMD_MAX_TRIS_COLLECT];
+ static int    g_tmdTriOrder[TMD_MAX_TRIS_COLLECT];
++#if defined(RE1_PORT_FAST)
++// r-esp32-evil: the sort keys of g_tmdTris, written as each triangle is
++// emitted. Sorting them is the same order as sorting the records, but the
++// sort no longer has to gather two fields out of every 136-byte record
++// (scattered over the pool, which is in PSRAM on the target: a cache miss
++// per triangle), and the draw loop reads the order straight from them.
++struct TmdSortKey { float depth; int ot; int idx; };
++static TmdSortKey s_tmdKeys[TMD_MAX_TRIS_COLLECT];
++#define TMD_ORDER(n, d, o) (s_tmdKeys[(n)].depth = (d), s_tmdKeys[(n)].ot = (o), s_tmdKeys[(n)].idx = (n))
++#else
++#define TMD_ORDER(n, d, o) (g_tmdTriOrder[(n)] = (n))
++#endif
+ 
+ // ============================================================================
+ // TmdQueue_Reset
+@@ -247,6 +291,7 @@ void TmdQueueObject(void* objData, int depth)
+         ls->col[i][0] = L[6]; ls->col[i][1] = L[7]; ls->col[i][2] = L[8];
+     }
+     ls->ambient = g_d3dAmbientColor;
++    TMD_LIGHT_AMBIENT(ls);
+ }
+ 
+ // ============================================================================
+@@ -280,6 +325,7 @@ void TmdQueueComplexObject(void* objData, void* elem, int depth)
+         ls->col[i][0] = L[6]; ls->col[i][1] = L[7]; ls->col[i][2] = L[8];
+     }
+     ls->ambient = g_d3dAmbientColor;
++    TMD_LIGHT_AMBIENT(ls);
+ }
+ 
+ // ============================================================================
+@@ -304,9 +350,13 @@ static void TmdComputeLight(const TmdLightState* ls, const float* n, const float
+ 
+     // Ambient from the latched g_d3dAmbientColor (packed r<<16|g<<8|b, 0..255)
+     // - NOT the live global, see TmdLightState.
++#if defined(RE1_PORT_FAST)
++    float r = ls->amb[0], g = ls->amb[1], b = ls->amb[2];
++#else
+     float r = (float)((ls->ambient >> 16) & 0xFF) / 255.0f;
+     float g = (float)((ls->ambient >> 8)  & 0xFF) / 255.0f;
+     float b = (float)( ls->ambient        & 0xFF) / 255.0f;
++#endif
+ 
+     for (int i = 0; i < 3; i++) {
+         // L[3..5] = direction, L[6..8] = colour, from the latched copy.
+@@ -362,8 +412,43 @@ static void TmdComputeLight(const TmdLightState* ls, const float* n, const float
+ // how many scene depths can exist, so this bound can never actually be reached.
+ #define TMD_MAX_SCENE_DEPTHS  320
+ 
+-void FlushTmdObjects(void)
++#if defined(RE1_PORT_FAST)
++// FlushTmdObjects' per-object vertex scratch: 7 floats and two flags per
++// vertex, grown to the largest object seen and kept.
++static float* s_tmdScratchF = NULL;
++static char*  s_tmdScratchC = NULL;
++static int    s_tmdScratchCap = 0;
++
++// In the target's internal RAM: the vertex loop writes six streams of it per
++// vertex, and from PSRAM every one of them is a cache miss now and then.
++extern "C" void* re1t_alloc_fast(size_t size);
++extern "C" void  re1t_free_large(void* p);
++
++static bool TmdScratchReserve(int vtxCount)
++{
++    if (vtxCount <= s_tmdScratchCap) return true;
++    const int cap = (vtxCount + 255) & ~255;
++    // Nothing in it outlives an object: free the old block first, so growing
++    // never holds both (internal RAM is scarce; re1t_alloc_fast falls back
++    // to PSRAM when it runs low).
++    re1t_free_large(s_tmdScratchF);
++    re1t_free_large(s_tmdScratchC);
++    s_tmdScratchF = NULL;
++    s_tmdScratchC = NULL;
++    s_tmdScratchCap = 0;
++    float* f = (float*)re1t_alloc_fast(sizeof(float) * (size_t)cap * 7);
++    char*  c = (char*)re1t_alloc_fast((size_t)cap * 2);  // clip flags, lit flags
++    if (f == NULL || c == NULL) { re1t_free_large(f); re1t_free_large(c); return false; }
++    s_tmdScratchF = f;
++    s_tmdScratchC = c;
++    s_tmdScratchCap = cap;
++    return true;
++}
++#endif
++
++RE1_HOT_FN void FlushTmdObjects(void)
+ {
++    RE1_PROF(RE1_PROF_TMD);
+     int queued = g_tmdQueueCount;
+ 
+     unsigned int maskDepths[TMD_MAX_SCENE_DEPTHS];
+@@ -409,6 +494,13 @@ void FlushTmdObjects(void)
+         // into pixels.
+         float nearZ = 2.0f * (float)g_sceneRenderParam;
+         if (nearZ < TMD_NEAR_Z) nearZ = TMD_NEAR_Z;   // fov never read / zero
++#if defined(RE1_PORT_FAST)
++        // The backbuffer, in the units sx/sy come out in (see the off-screen
++        // test below).
++        DWORD bbW = 0, bbH = 0;
++        Marni_DX()->GetBackBufferSize(&bbW, &bbH);
++        const float screenW = (float)bbW, screenH = (float)bbH;
++#endif
+ 
+         // Is the original's OWN per-texel path aimed at something this frame?
+         // FUN_00484c40 knocks the STP texels out of a COPY of the page and
+@@ -471,6 +563,9 @@ void FlushTmdObjects(void)
+                 continue;
+             if (primType != 3 && primType != 4)
+                 continue;
++            RE1_WORK(RE1_WORK_OBJECTS, 1);
++            RE1_WORK(RE1_WORK_VERTICES, vtxCount);
++            RE1_WORK(RE1_WORK_PRIMS, listCount);
+ 
+             // Read the transform and texture handle now (see TmdQueueObject):
+             // both are written to the object entry after it was queued.
+@@ -579,40 +674,37 @@ void FlushTmdObjects(void)
+ 
+             // Transform + project + light every vertex
+             // (heap-allocate per object; vertex counts are small)
++#if defined(RE1_PORT_FAST)
++            // r-esp32-evil: one grow-only scratch for every object instead of
++            // three heap round trips per object (a frame queues hundreds).
++            if (!TmdScratchReserve(vtxCount)) continue;
++            float* sx = s_tmdScratchF;
++            float* cr = s_tmdScratchF + (size_t)vtxCount * 4;
++            char* clipped = s_tmdScratchC;
++            char* lit = s_tmdScratchC + s_tmdScratchCap;   // coloured yet?
++#else
+             float* sx = (float*)malloc(sizeof(float) * vtxCount * 4);
+-            float* sy = sx + vtxCount;
+-            float* vzArr = sx + vtxCount * 2;   // view-space Z, for the depth sort
+             float* cr = (float*)malloc(sizeof(float) * vtxCount * 3);
+-            float* cg = cr + vtxCount;
+-            float* cb = cg + vtxCount;
+             char* clipped = (char*)malloc(vtxCount);
+             if (!sx || !cr || !clipped) {
+                 free(sx); free(cr); free(clipped);
+                 continue;
+             }
++#endif
++            float* sy = sx + vtxCount;
++            float* vzArr = sx + vtxCount * 2;   // view-space Z, for the depth sort
++            float* cg = cr + vtxCount;
++            float* cb = cg + vtxCount;
+ 
+             // First normal (flat-shaded primitives only fill vertex 0)
+             float flatN[3] = { vbuf[3], vbuf[4], vbuf[5] };
+ 
+-            for (int v = 0; v < vtxCount; v++) {
++            // The colour of vertex v. RE1_PORT_FAST: only for the vertices of
++            // primitives that are drawn (lit on first use below) - every
++            // vertex's colour is independent of the others, so the drawn
++            // result is the same; the back half of a model is not lit.
++            auto shadeVertex = [&](int v) {
+                 const float* vtx = vbuf + v * 11;
+-                float x = vtx[0], y = vtx[1], z = vtx[2];
+-                float vx = M[0] * x + M[4] * y + M[8]  * z + M[12];
+-                float vy = M[1] * x + M[5] * y + M[9]  * z + M[13];
+-                float vz = M[2] * x + M[6] * y + M[10] * z + M[14];
+-
+-                vzArr[v] = vz;
+-                if (vz < nearZ) {
+-                    clipped[v] = 1;
+-                    sx[v] = sy[v] = 0.0f;
+-                }
+-                else {
+-                    clipped[v] = 0;
+-                    float iz = fg / vz;
+-                    sx[v] = cx + vx * iz * scaleX;
+-                    sy[v] = cy - vy * iz * scaleY;
+-                }
+-
+                 if (unlit) {
+                     // The original's else-branch at 0x00447043: no ambient, no
+                     // lights, the vertex colour becomes the primitive colour.
+@@ -665,9 +757,45 @@ void FlushTmdObjects(void)
+                     // here, so this is a no-op for them.
+                     cr[v] *= objScaleR; cg[v] *= objScaleG; cb[v] *= objScaleB;
+                 }
++            };
++
++            {
++            RE1_PROF(RE1_PROF_TMD);
++            for (int v = 0; v < vtxCount; v++) {
++                const float* vtx = vbuf + v * 11;
++                float x = vtx[0], y = vtx[1], z = vtx[2];
++                float vx = M[0] * x + M[4] * y + M[8]  * z + M[12];
++                float vy = M[1] * x + M[5] * y + M[9]  * z + M[13];
++                float vz = M[2] * x + M[6] * y + M[10] * z + M[14];
++
++                vzArr[v] = vz;
++                if (vz < nearZ) {
++                    clipped[v] = 1;
++                    sx[v] = sy[v] = 0.0f;
++                }
++                else {
++                    clipped[v] = 0;
++#if defined(RE1_PORT_FAST)
++                    // r-esp32-evil: the same quotient without the library call
++                    // (re1_fastmath.h) - once per vertex, ~7000 a frame.
++                    float iz = re1_div(fg, vz);
++#else
++                    float iz = fg / vz;
++#endif
++                    sx[v] = cx + vx * iz * scaleX;
++                    sy[v] = cy - vy * iz * scaleY;
++                }
++
++#if defined(RE1_PORT_FAST)
++                lit[v] = 0;
++#else
++                shadeVertex(v);
++#endif
++            }
+             }
+ 
+             // Emit triangles
++            RE1_PROF(RE1_PROF_TMDASM);
+             for (int pIdx = 0; pIdx < listCount; pIdx++) {
+                 WORD idx[4];
+                 int vertsInPrim = (primType == 3) ? 3 : 4;
+@@ -708,6 +836,34 @@ void FlushTmdObjects(void)
+                 float x2 = sx[idx[2]], y2 = sy[idx[2]];
+                 if ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0) <= 0.0f)
+                     continue;
++#if defined(RE1_PORT_FAST)
++                // r-esp32-evil: a primitive wholly off the screen covers no
++                // pixel, so it is dropped here - before it is lit, recorded,
++                // sorted and handed to the rasteriser to find that out. A
++                // camera often has most of the geometry outside it (room 112's
++                // second camera: 1086 triangles a frame, 232 pixels). Strict
++                // bounds, so only what the rasteriser would draw nothing of
++                // goes: every corner left of x 0, above y 0, right of the
++                // width or below the height.
++                {
++                    float minX = sx[idx[0]], maxX = minX, minY = sy[idx[0]], maxY = minY;
++                    for (int v = 1; v < vertsInPrim; v++) {
++                        const float px = sx[idx[v]], py = sy[idx[v]];
++                        minX = px < minX ? px : minX;  maxX = px > maxX ? px : maxX;
++                        minY = py < minY ? py : minY;  maxY = py > maxY ? py : maxY;
++                    }
++                    if (maxX < 0.0f || maxY < 0.0f || minX > screenW || minY > screenH) {
++                        RE1_WORK(RE1_WORK_OFFSCREEN, 1);
++                        continue;
++                    }
++                }
++                for (int v = 0; v < vertsInPrim; v++) {
++                    if (!lit[idx[v]]) {
++                        lit[idx[v]] = 1;
++                        shadeVertex(idx[v]);
++                    }
++                }
++#endif
+ 
+                 // Triangulate: (0,1,2) + (0,2,3) for quads
+                 for (int t = 0; t < vertsInPrim - 2; t++) {
+@@ -742,7 +898,7 @@ void FlushTmdObjects(void)
+                     t3->tex   = tex;
+                     t3->alpha = triAlpha;
+                     t3->otDepth = e->depth;
+-                    g_tmdTriOrder[collected] = collected;
++                    TMD_ORDER(collected, t3->depth, e->depth);
+                     collected++;
+ 
+                     // Second, opaque pass over the same geometry with the STP
+@@ -773,13 +929,15 @@ void FlushTmdObjects(void)
+                         k3->tex     = (DWORD)knockTex;
+                         k3->alpha   = triAlpha;
+                         k3->otDepth = e->depth;
+-                        g_tmdTriOrder[collected] = collected;
++                        TMD_ORDER(collected, k3->depth, e->depth);
+                         collected++;
+                     }
+                 }
+             }
+ 
++#if !defined(RE1_PORT_FAST)
+             free(sx); free(cr); free(clipped);
++#endif
+         }
+ 
+         // The depth buffer resolves which face wins, so the sort is no longer
+@@ -804,6 +962,21 @@ void FlushTmdObjects(void)
+         // wash first, opaque over the top, punched texels keeping the wash. The
+         // collection index is the last resort, so the whole order is
+         // deterministic frame to frame.
++#if defined(RE1_PORT_FAST)
++        {
++            // r-esp32-evil: the same order, sorted on a compact copy of the
++            // keys - comparing in place reads two 136-byte records per step,
++            // scattered over hundreds of KB (PSRAM on the target).
++            RE1_PROF(RE1_PROF_TMDSORT);
++            std::sort(s_tmdKeys, s_tmdKeys + collected,
++                      [](const TmdSortKey& a, const TmdSortKey& b) {
++                if (a.depth != b.depth) return a.depth > b.depth;
++                if (a.ot != b.ot)       return a.ot > b.ot;
++                return a.idx < b.idx;
++            });
++        }
++        RE1_PROF(RE1_PROF_TMDSUB);
++#else
+         std::sort(g_tmdTriOrder, g_tmdTriOrder + collected, [](int a, int b) {
+             const TmdTri& ta = g_tmdTris[a];
+             const TmdTri& tb = g_tmdTris[b];
+@@ -811,14 +984,32 @@ void FlushTmdObjects(void)
+             if (ta.otDepth != tb.otDepth) return ta.otDepth > tb.otDepth;
+             return a < b;
+         });
+-
++#endif
++
++#if defined(RE1_PORT_FAST)
++        // r-esp32-evil: the batch is a list of pointers into the sorted pool
++        // (DrawTriangles3DList) rather than a copy of every triangle - the
++        // copy cost a cache miss or two per triangle on the target, twice.
++        static const float* triList[TMD_MAX_TRIS_FLUSH];
++#define TMD_DRAW_BATCH() \
++        Marni_DX()->DrawTriangles3DList(triList, triCount, (MarniHandle)triTex, \
++                                        MARNI_SAMPLER_POINT, MARNI_BLEND_ALPHA, triWrite)
++#else
+         static float triVerts[TMD_MAX_TRIS_FLUSH * TMD_TRI_FLOATS];
++#define TMD_DRAW_BATCH() \
++        Marni_DX()->DrawTriangles3D(triVerts, triCount, (MarniHandle)triTex, \
++                                    MARNI_SAMPLER_POINT, MARNI_BLEND_ALPHA, triWrite)
++#endif
+         int   triCount = 0;
+         DWORD triTex   = 0;
+         bool  triWrite = true;   // depth-WRITE mode of the batch in flight
+ 
+         for (int k = 0; k < collected; k++) {
++#if defined(RE1_PORT_FAST)
++            const TmdTri* t3 = &g_tmdTris[s_tmdKeys[k].idx];
++#else
+             const TmdTri* t3 = &g_tmdTris[g_tmdTriOrder[k]];
++#endif
+             const bool triWriteThis = t3->alpha >= 0.999f;
+ 
+             // Every scene sprite farther than this triangle has to be on
+@@ -826,9 +1017,7 @@ void FlushTmdObjects(void)
+             // goes down first.
+             while (maskIdx < maskCount && (float)maskDepths[maskIdx] > t3->depth) {
+                 if (triCount > 0) {
+-                    Marni_DX()->DrawTriangles3D(triVerts, triCount, (MarniHandle)triTex,
+-                                                MARNI_SAMPLER_POINT, MARNI_BLEND_ALPHA,
+-                                                triWrite);
++                    TMD_DRAW_BATCH();
+                     triCount = 0;
+                 }
+                 FlushSpriteCommandsRange(maskDepths[maskIdx], maskCursor, SPRITE_CLASS_SCENE);
+@@ -838,21 +1027,22 @@ void FlushTmdObjects(void)
+ 
+             if ((triCount > 0 && (t3->tex != triTex || triWriteThis != triWrite)) ||
+                 triCount >= TMD_MAX_TRIS_FLUSH) {
+-                Marni_DX()->DrawTriangles3D(triVerts, triCount, (MarniHandle)triTex,
+-                                            MARNI_SAMPLER_POINT, MARNI_BLEND_ALPHA,
+-                                            triWrite);
++                TMD_DRAW_BATCH();
+                 triCount = 0;
+             }
+             triTex = t3->tex;
+             triWrite = triWriteThis;
++#if defined(RE1_PORT_FAST)
++            triList[triCount] = t3->v;
++#else
+             memcpy(triVerts + triCount * TMD_TRI_FLOATS, t3->v, sizeof(t3->v));
++#endif
+             triCount++;
+         }
+         if (triCount > 0) {
+-            Marni_DX()->DrawTriangles3D(triVerts, triCount, (MarniHandle)triTex,
+-                                        MARNI_SAMPLER_POINT, MARNI_BLEND_ALPHA,
+-                                        triWrite);
++            TMD_DRAW_BATCH();
+         }
++#undef TMD_DRAW_BATCH
+     }
+ 
+     // The scene sprites nearer than the last triangle - and, when no entity was
+diff --git a/src/game/entities/EntityCommon.cpp b/src/game/entities/EntityCommon.cpp
+index 8c76c8e..267be2f 100644
+--- a/src/game/entities/EntityCommon.cpp
++++ b/src/game/entities/EntityCommon.cpp
+@@ -18,6 +18,15 @@
+ #include "../saturn/SaturnTyrant.h"     // saturn_capsule_collision
+ #include <cstring>
+ 
++#if defined(RE1_PORT_EXTRAS)
++// r-esp32-evil EXTRAS > INVISIBLE (port/common/Extras.cpp): the shared sight
++// and contact checks report the player as out of reach.
++extern "C" int g_re1portInvisible;
++#define RE1_INVISIBLE() (g_re1portInvisible != 0)
++#else
++#define RE1_INVISIBLE() 0
++#endif
++
+ // Plant 42 boss update (0x00464d10).
+ extern void plant42_update(void);
+ // Yawn (giant snake) boss update (0x004051e0) - Yawn.cpp.
+@@ -200,6 +209,8 @@ void entity_rotate_toward_target(VECTOR* pos, unsigned short angleStep)
+ // ============================================================================
+ unsigned char check_line_of_sight(VECTOR* targetPos)
+ {
++    if (RE1_INVISIBLE()) return 1;   // 1 = view blocked
++
+     g_svecScratch.z = 0;
+     g_svecScratch.y = 0;
+     g_svecScratch.x = 0;
+@@ -226,6 +237,8 @@ unsigned char check_line_of_sight(VECTOR* targetPos)
+ // ============================================================================
+ unsigned int entity_check_angular_los(short fovHalfAngle, VECTOR* targetPos)
+ {
++    if (RE1_INVISIBLE()) return 1;   // non-zero = blocked / outside the wedge
++
+     short targetAngle = getAngleTowardsTarget(targetPos->x, targetPos->z);
+     unsigned short delta = ((unsigned short)(fovHalfAngle - ENTITY->angle) + (unsigned short)targetAngle) & 0xFFF;
+ 
+@@ -255,6 +268,8 @@ unsigned int entity_check_angular_los(short fovHalfAngle, VECTOR* targetPos)
+ // ============================================================================
+ unsigned char checkAngularViewAndDistance(short fovHalfAngle, short maxDistance, VECTOR* targetPos)
+ {
++    if (RE1_INVISIBLE()) return 0;
++
+     VECTOR referenceForward = { 2000, 0, 0, 0 };
+ 
+     VECTOR dirToTarget;
+@@ -290,6 +305,8 @@ unsigned char checkAngularViewAndDistance(short fovHalfAngle, short maxDistance,
+ // ============================================================================
+ unsigned int entity_check_visual_range(unsigned int range)
+ {
++    if (RE1_INVISIBLE()) return 0x7FFF;   // far away, flag not set
++
+     int dx = (int)g_playerEntity.scaMatrixData.localMatrix.t[0]
+            - (int)ENTITY->scaMatrixData.localMatrix.t[0];
+     int dz = (int)g_playerEntity.scaMatrixData.localMatrix.t[2]
+@@ -309,6 +326,8 @@ unsigned int entity_check_visual_range(unsigned int range)
+ // ============================================================================
+ unsigned int entity_check_alert_range(unsigned int range)
+ {
++    if (RE1_INVISIBLE()) return 0x7FFF;
++
+     int dx = (int)g_playerEntity.scaMatrixData.localMatrix.t[0]
+            - (int)ENTITY->scaMatrixData.localMatrix.t[0];
+     int dz = (int)g_playerEntity.scaMatrixData.localMatrix.t[2]
+diff --git a/src/game/saturn/SaturnBattle.cpp b/src/game/saturn/SaturnBattle.cpp
+index fe6bc83..e9c3223 100644
+--- a/src/game/saturn/SaturnBattle.cpp
++++ b/src/game/saturn/SaturnBattle.cpp
+@@ -4,6 +4,7 @@
+ // docs/SATURN_VERSION_ANALYSIS.md 4d-4f for the original. Every Saturn address below
+ // is quoted with the module it was read from; the eleven .PRG overlays are
+ // separate compilations, so an address is only meaningful in its own module.
++#include "../../PortMem.h"
+ #include "SaturnBattle.h"
+ 
+ #include "../../Globals.h"
+@@ -1584,7 +1585,7 @@ static void sat_logo_draw(float scaleX, float scaleY)
+         faces[j + 1] = f;
+     }
+ 
+-    static float verts[1024 * 3][10];
++    RE1_SCRATCH(float[10], verts, 1024 * 3);
+     int tris = 0;
+     for (int i = 0; i < n; i++) {
+         const SatLogoPoly* q = &s_logoPolys[faces[i].poly];
+diff --git a/src/marni/MarniDX.h b/src/marni/MarniDX.h
+index c2ffa25..99aeb55 100644
+--- a/src/marni/MarniDX.h
++++ b/src/marni/MarniDX.h
+@@ -222,6 +222,16 @@ public:
+                          MarniSampler sampler = MARNI_SAMPLER_POINT,
+                          MarniBlend  blend   = MARNI_BLEND_ALPHA,
+                          bool depthWrite = true);
++#if defined(RE1_PORT_FAST)
++    // r-esp32-evil: DrawTriangles3D over triangles that are not adjacent in
++    // memory - tris[i] points at triangle i's 3 x 10 floats. Lets
++    // FlushTmdObjects draw its depth-sorted pool in place instead of copying
++    // every triangle into a contiguous batch first. Same pixels.
++    void DrawTriangles3DList(const float* const* tris, int triCount, MarniHandle tex,
++                             MarniSampler sampler = MARNI_SAMPLER_POINT,
++                             MarniBlend  blend   = MARNI_BLEND_ALPHA,
++                             bool depthWrite = true);
++#endif
+ 
+     // ----------------------------------------------------------------------
+     // Backbuffer readback (used by CMarniBits::SaveBitmapToFile, the original
+diff --git a/src/marni/MarniSystem.cpp b/src/marni/MarniSystem.cpp
+index 7fc8a77..cdaf5cf 100644
+--- a/src/marni/MarniSystem.cpp
++++ b/src/marni/MarniSystem.cpp
+@@ -162,6 +162,24 @@ static CMarniDirect3D* MarniDirect3D_Construct(CMarniDirect3D* pThis,
+ // ============================================================================
+ // Memory operators (unchanged from original: 0x00433370, 0x004333e0)
+ // ============================================================================
++#if defined(RE1_SMALL_MEM)
++// r-esp32-evil: the 256 KB RGBA pictures built through these (model skins)
++// take the port's reserved block (PortMem.h) instead of a fresh 256 KB.
++#include "../PortMem.h"
++
++#if defined(RE1_PORT_TEXTURE_PAL8)
++extern "C" void re1port_texture_hint(int modelSkin);   // port/marni/MarniDX_SW.cpp
++#endif
++void* operator_new(size_t size)
++{
++    return re1port_big_alloc(size);
++}
++
++void operator_delete(void* ptr)
++{
++    re1port_big_free(ptr);
++}
++#else
+ void* operator_new(size_t size)
+ {
+     return malloc(size);
+@@ -171,6 +189,7 @@ void operator_delete(void* ptr)
+ {
+     if (ptr) free(ptr);
+ }
++#endif
+ 
+ // ============================================================================
+ // CMarniDirect3D_Constructor — C-style constructor wrapper (0x0044baf0)
+@@ -899,7 +918,15 @@ static int VTable_CreateTextureHandle(void* self, void* texDesc,
+     }
+     if (hdDeferred)
+         tex = HdUploadDeferred(pD3D->m_pDX, w, h, rgba, hdToken, HdBuildWhole);
++#if defined(RE1_PORT_TEXTURE_PAL8)
++    // r-esp32-evil: a model skin - palette art, which the software backend may
++    // keep as 8-bit indices + palette (half the memory, same colours).
++    re1port_texture_hint(1);
++#endif
+     if (tex == MARNI_NULL_HANDLE) tex = CreateTextureHd(pD3D->m_pDX, w, h, rgba);
++#if defined(RE1_PORT_TEXTURE_PAL8)
++    re1port_texture_hint(0);
++#endif
+     if (tex == MARNI_NULL_HANDLE) { operator_delete(rgba); return 0; }
+ 
+     // Knock-out twin - the same image with every STP texel made fully
+diff --git a/src/video/VideoPlayback.cpp b/src/video/VideoPlayback.cpp
+index b7b1c73..08fa411 100644
+--- a/src/video/VideoPlayback.cpp
++++ b/src/video/VideoPlayback.cpp
+@@ -266,18 +266,28 @@ static BOOL PreferModernSibling(const char* aviPath, char* out, size_t size)
+     const size_t prefix = (size_t)(dot - aviPath);
+     if (prefix + 5 > MAX_PATH) return FALSE;
+     memcpy(candidate, aviPath, prefix);
+-    strcpy_s(candidate + prefix, sizeof(candidate) - prefix, ".mp4");
+ 
+-    char resolved[MAX_PATH];
+-    const char* candidatePath = ResolveVideoPath(candidate, resolved, sizeof(resolved));
+-    if (candidatePath == NULL) candidatePath = candidate;
++#if defined(RE1_PORT_VIDEO_RV1)
++    // r-esp32-evil: the SD card carries re-encoded ".rv1" movies only.
++    static const char* const kExts[] = { ".rv1", ".mp4" };
++#else
++    static const char* const kExts[] = { ".mp4" };
++#endif
++    for (size_t e = 0; e < sizeof(kExts) / sizeof(kExts[0]); ++e) {
++        strcpy_s(candidate + prefix, sizeof(candidate) - prefix, kExts[e]);
+ 
+-    char normalized[MAX_PATH];
+-    plat_normalize_path(candidatePath, normalized, sizeof(normalized));
+-    if (!FileReadable(normalized)) return FALSE;
++        char resolved[MAX_PATH];
++        const char* candidatePath = ResolveVideoPath(candidate, resolved, sizeof(resolved));
++        if (candidatePath == NULL) candidatePath = candidate;
+ 
+-    strcpy_s(out, size, normalized);
+-    return TRUE;
++        char normalized[MAX_PATH];
++        plat_normalize_path(candidatePath, normalized, sizeof(normalized));
++        if (!FileReadable(normalized)) continue;
++
++        strcpy_s(out, size, normalized);
++        return TRUE;
++    }
++    return FALSE;
+ }
+ 
+ BOOL CheckVideoFileExists(const char* filename)
