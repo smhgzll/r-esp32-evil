@@ -1,4 +1,4 @@
-# r-esp32-evil
+# resident-evil-1-esp32
 
 Resident Evil (PC, 1997) running on an **ESP32-S3** microcontroller, with a
 1.8" SPI screen, a micro-SD card, an I2S DAC and a Bluetooth Xbox controller.
